@@ -14,6 +14,11 @@ export default function SendEmails() {
   const [newTemplatePrompt, setNewTemplatePrompt] = useState('');
   const [templates, setTemplates] = useState([]);
   const [isLoading, setIsLoading] = useState(true);
+  const [showProgressModal, setShowProgressModal] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [currentEmail, setCurrentEmail] = useState(0);
+  const [totalEmails, setTotalEmails] = useState(0);
+  const [attachments, setAttachments] = useState([]);
 
   useEffect(() => {
     const fetchData = async () => {
@@ -28,7 +33,7 @@ export default function SendEmails() {
         const countRes = await fetch('http://127.0.0.1:8000/leads/count');
         const countData = await countRes.json();
         setTotalLeads(countData.count);
-        
+
         setIsLoading(false);
       } catch (error) {
         toast.error('Failed to load data');
@@ -38,68 +43,133 @@ export default function SendEmails() {
     fetchData();
   }, []);
 
+  const handleFileUpload = (e) => {
+    const files = Array.from(e.target.files);
+    if (files.length === 0) return;
+
+    const newAttachments = [];
+
+    files.forEach(file => {
+      if (file.type !== 'application/pdf') {
+        toast.error('Only PDF files are allowed');
+        return;
+      }
+
+      const reader = new FileReader();
+      reader.onload = (event) => {
+        // This gets the base64 content after the comma
+        const base64Content = event.target.result.split(',')[1];
+        newAttachments.push({
+          filename: file.name,
+          content: base64Content
+        });
+
+        if (newAttachments.length === files.length) {
+          setAttachments(prev => [...prev, ...newAttachments]);
+        }
+      };
+      reader.readAsDataURL(file);
+    });
+  };
+
   const handleSendEmails = async () => {
     setIsSending(true);
-    const toastId = toast.loading(`Sending ${emailsToSend} emails...`);
-    
+    setShowProgressModal(true);
+    setProgress(0);
+    setCurrentEmail(0);
+
     try {
       const leadsRes = await fetch('http://127.0.0.1:8000/leads?limit=1000');
       const unsentLeads = await leadsRes.json();
-      
+
       const leadsToSend = [];
       let remainingLeads = [...unsentLeads];
-      
+
       for (const dist of distribution) {
         if (dist.count <= 0) continue;
         const templateLeads = remainingLeads.splice(0, dist.count);
-        leadsToSend.push(...templateLeads.map(lead => ({
-          lead_id: lead.id,
-          template_id: dist.templateId
-        })));
+        leadsToSend.push(
+          ...templateLeads.map((lead) => ({
+            lead_id: lead.id,
+            template_id: dist.templateId,
+          }))
+        );
       }
-      
+
       if (leadsToSend.length === 0) {
         throw new Error('No unsent leads available to send');
       }
-      
-      const templateGroups = {};
-      leadsToSend.forEach(item => {
-        if (!templateGroups[item.template_id]) {
-          templateGroups[item.template_id] = [];
-        }
-        templateGroups[item.template_id].push(item.lead_id);
-      });
-      
-      const sendPromises = Object.entries(templateGroups).map(([templateId, leadIds]) => 
-        fetch('http://127.0.0.1:8000/send-emails', {
+
+      setTotalEmails(leadsToSend.length);
+
+      // Sequential send with 15s delay
+      for (let i = 0; i < leadsToSend.length; i++) {
+        const { lead_id, template_id } = leadsToSend[i];
+
+        await fetch('http://127.0.0.1:8000/send-emails', {
           method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
+          headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            template_id: templateId,
-            lead_ids: leadIds
+            template_id,
+            lead_ids: [lead_id],
+            attachments: attachments.length > 0 ? attachments : undefined
           }),
-        })
-      );
-      
-      await Promise.all(sendPromises);
-      
+        });
+
+        setCurrentEmail(i + 1);
+        setProgress(Math.round(((i + 1) / leadsToSend.length) * 100));
+
+        if (i < leadsToSend.length - 1) {
+          await new Promise((resolve) => setTimeout(resolve, 15000));
+        }
+      }
+
       const verifyRes = await fetch('http://127.0.0.1:8000/leads/count');
       const countData = await verifyRes.json();
       setTotalLeads(countData.count);
-      
-      toast.success(`Successfully sent ${leadsToSend.length} emails`, { id: toastId });
+
+      toast.success(`Successfully sent ${leadsToSend.length} emails`);
     } catch (error) {
-      toast.error(`Failed to send emails: ${error.message}`, { id: toastId });
+      toast.error(`Failed to send emails: ${error.message}`);
     } finally {
       setIsSending(false);
+      setTimeout(() => {
+        setShowProgressModal(false);
+      }, 1000); // Give a small delay so user can see 100% completion
     }
   };
 
-  const handleRephrase = () => {
-    setEmailContent(`Hi {First Name},\n\nAfter reviewing your work at {Company}, I wanted to connect about potential collaboration.\n\nBest regards,\nYour Name`);
-    toast.success('Email rephrased');
+  const handleRephrase = async () => {
+    if (!selectedTemplate) return;
+
+    const toastId = toast.loading('Rephrasing email...');
+    try {
+      const response = await fetch('http://127.0.0.1:8000/rephrase-email', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          template_id: selectedTemplate.id,
+          content: emailContent
+        }),
+      });
+
+      const result = await response.json();
+
+      if (result.success) {
+        setEmailContent(result.rephrased_content);
+        // Update the selected template with the new content
+        setSelectedTemplate(result.template);
+        // Update the templates list
+        setTemplates(templates.map(t =>
+          t.id === result.template.id ? result.template : t
+        ));
+        toast.success('Email rephrased and saved!', { id: toastId });
+      } else {
+        throw new Error('Rephrasing failed');
+      }
+    } catch (error) {
+      toast.error('Failed to rephrase email', { id: toastId });
+    }
   };
 
   const handleAddDistribution = () => {
@@ -111,14 +181,14 @@ export default function SendEmails() {
   const handleDistributionChange = (index, field, value) => {
     const newDistribution = [...distribution];
     newDistribution[index][field] = field === 'count' ? parseInt(value) || 0 : value;
-    
+
     const totalSelected = newDistribution.reduce((sum, item) => sum + item.count, 0);
     const remainingLeads = totalLeads - totalSelected;
-    
+
     if (remainingLeads < 0) {
       newDistribution[index].count = Math.max(0, newDistribution[index].count + remainingLeads);
     }
-    
+
     setEmailsToSend(newDistribution.reduce((sum, item) => sum + item.count, 0));
     setDistribution(newDistribution);
   };
@@ -137,7 +207,7 @@ export default function SendEmails() {
           content: `Hi {First Name},\n\n${newTemplatePrompt}\n\nBest,\nYour Team`
         }),
       });
-      
+
       const savedTemplate = await response.json();
       setTemplates([...templates, savedTemplate]);
       setSelectedTemplate(savedTemplate);
@@ -179,7 +249,7 @@ export default function SendEmails() {
               <div className="p-5 border-b border-gray-200">
                 <div className="flex justify-between items-center">
                   <h2 className="text-lg font-semibold text-gray-800">Distribution</h2>
-                  <button 
+                  <button
                     onClick={handleAddDistribution}
                     disabled={isSending}
                     className="text-sm text-indigo-600 disabled:opacity-50"
@@ -244,20 +314,24 @@ export default function SendEmails() {
               </div>
               <div className="p-5 grid grid-cols-1 gap-3">
                 {templates.map(template => (
-                  <div 
+                  <div
                     key={template.id}
-                    onClick={() => !isSending && setSelectedTemplate(template)}
-                    className={`p-4 rounded-lg border cursor-pointer ${
-                      selectedTemplate?.id === template.id 
-                        ? 'border-indigo-500 bg-indigo-50' 
-                        : 'border-gray-200'
-                    } ${isSending ? 'opacity-50 cursor-not-allowed' : ''}`}
+                    onClick={() => {
+                      if (!isSending) {
+                        setSelectedTemplate(template);
+                        setEmailContent(template.content);
+                      }
+                    }}
+                    className={`p-4 rounded-lg border cursor-pointer ${selectedTemplate?.id === template.id
+                      ? 'border-indigo-500 bg-indigo-50'
+                      : 'border-gray-200'
+                      } ${isSending ? 'opacity-50 cursor-not-allowed' : ''}`}
                   >
                     <div className="font-medium text-gray-800">{template.name}</div>
                     <div className="text-sm text-gray-500 mt-1 truncate">{template.subject}</div>
                   </div>
                 ))}
-                <button 
+                <button
                   onClick={() => setShowNewTemplateModal(true)}
                   disabled={isSending}
                   className="mt-2 p-3 rounded-lg border border-dashed border-gray-300 text-gray-600 disabled:opacity-50"
@@ -293,13 +367,47 @@ export default function SendEmails() {
                 <input
                   type="text"
                   value={selectedTemplate?.subject || ''}
-                  onChange={(e) => setSelectedTemplate({...selectedTemplate, subject: e.target.value})}
+                  onChange={(e) => setSelectedTemplate({ ...selectedTemplate, subject: e.target.value })}
                   disabled={isSending}
                   className="mt-2 w-full rounded-md border-gray-300 shadow-sm text-lg font-medium py-2 disabled:opacity-50"
                   placeholder="Subject"
                 />
               </div>
               <div className="flex-1 p-5 overflow-auto">
+                <div className="mt-4">
+                  <label className="block text-sm font-medium text-gray-700 mb-1">
+                    Attachments
+                  </label>
+                  <input
+                    type="file"
+                    onChange={handleFileUpload}
+                    multiple
+                    accept=".pdf"
+                    disabled={isSending}
+                    className="block w-full text-sm text-gray-500
+                    file:mr-4 file:py-2 file:px-4
+                    file:rounded-md file:border-0
+                    file:text-sm file:font-semibold
+                    file:bg-indigo-50 file:text-indigo-700
+                    hover:file:bg-indigo-100
+                    disabled:opacity-50"
+                  />
+                  {attachments.length > 0 && (
+                    <div className="mt-2 space-y-1">
+                      {attachments.map((file, index) => (
+                        <div key={index} className="flex items-center text-sm text-gray-600">
+                          <span className="truncate">{file.filename}</span>
+                          <button
+                            onClick={() => setAttachments(attachments.filter((_, i) => i !== index))}
+                            className="ml-2 text-red-500 hover:text-red-700"
+                          >
+                            &times;
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
                 <textarea
                   value={emailContent}
                   onChange={(e) => setEmailContent(e.target.value)}
@@ -350,6 +458,50 @@ export default function SendEmails() {
                 Create
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {showProgressModal && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
+          <div className="bg-white rounded-xl max-w-md w-full p-6">
+            <div className="flex justify-between items-center mb-4">
+              <h3 className="text-lg font-bold">Sending Emails</h3>
+              <span className="text-sm text-gray-600">
+                {currentEmail} of {totalEmails}
+              </span>
+            </div>
+
+            <div className="w-full bg-gray-200 rounded-full h-2.5 mb-4">
+              <div
+                className="bg-indigo-600 h-2.5 rounded-full transition-all duration-300"
+                style={{ width: `${progress}%` }}
+              ></div>
+            </div>
+
+            <div className="flex justify-between text-sm text-gray-600 mb-2">
+              <span>Progress:</span>
+              <span>{progress}%</span>
+            </div>
+
+            <div className="text-sm text-gray-500">
+              {progress < 100 ? (
+                <p>Sending emails... Please don't close this window.</p>
+              ) : (
+                <p className="text-green-600">All emails sent successfully!</p>
+              )}
+            </div>
+
+            {progress === 100 && (
+              <div className="mt-4 flex justify-end">
+                <button
+                  onClick={() => setShowProgressModal(false)}
+                  className="px-4 py-2 text-sm rounded-md text-white bg-indigo-600"
+                >
+                  Close
+                </button>
+              </div>
+            )}
           </div>
         </div>
       )}

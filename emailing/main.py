@@ -1,6 +1,8 @@
 import os
 import re
 import asyncio
+import base64
+import traceback
 from typing import List, Optional, Any, Dict
 from datetime import datetime
 from pydantic import BaseModel, Field, EmailStr
@@ -17,6 +19,8 @@ from email.utils import formataddr
 from email import encoders
 from email.mime.base import MIMEBase
 import time
+from agents import Agent, Runner, AsyncOpenAI, OpenAIChatCompletionsModel
+from agents.run import RunConfig
 
 load_dotenv()
 
@@ -29,11 +33,15 @@ SMTP_SENDER = os.getenv("SMTP_SENDER")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", 465))
-SMTP_DELAY = float(os.getenv("SMTP_DELAY", 1.0))  # seconds between emails in the blocking send loop
+SMTP_DELAY = float(os.getenv("SMTP_DELAY", 15.0))  # seconds between emails in the blocking send loop
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "*")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 if not SMTP_SENDER or not SMTP_PASSWORD:
     print("Warning: SMTP_SENDER or SMTP_PASSWORD not set in environment. /send-emails will fail without them.")
+
+if not GEMINI_API_KEY:
+    print("Warning: GEMINI_API_KEY not set. Email rephrasing will not work.")
 
 # --------------------
 # FastAPI + Mongo
@@ -97,13 +105,255 @@ class LeadOut(LeadIn):
     mail_sent: bool = False
     created_at: datetime
 
+class Attachment(BaseModel):
+    filename: str
+    content: str  # base64 encoded content
+
 class SendEmailsPayload(BaseModel):
     template_id: str
-    lead_ids: Optional[List[str]] = None  # if not provided, endpoint can pick leads based on logic
+    lead_ids: Optional[List[str]] = None
+    attachments: Optional[List[Attachment]] = None
+
+class RephraseOutput(BaseModel):
+    rephrased_email: str
+
+class RephraseRequest(BaseModel):
+    template_id: str
+    content: str
 
 # --------------------
-# Templates endpoints
+# Email Rephrase Agent Setup
 # --------------------
+def setup_rephrase_agent():
+    if not GEMINI_API_KEY:
+        return None
+    
+    try:
+        external_client = AsyncOpenAI(
+            api_key=GEMINI_API_KEY,
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+            timeout=30.0
+        )
+
+        model = OpenAIChatCompletionsModel(
+            model='gemini-2.0-flash',
+            openai_client=external_client
+        )
+
+        return Agent(
+            name='Email Rephrase agent',
+            instructions='You are email rephrase agent. You rephrase the given email in human wordings. Do not change the meaning and just change the wordings.',
+            model=model,
+            output_type=RephraseOutput
+        )
+    except Exception as e:
+        print(f"Failed to initialize rephrase agent: {str(e)}")
+        traceback.print_exc()
+        return None
+
+rephrase_agent = setup_rephrase_agent()
+
+# --------------------
+# Email sending helpers
+# --------------------
+def build_message(
+    sender_email: str, 
+    recipient_email: str, 
+    subject: str, 
+    body: str, 
+    sender_name: Optional[str] = None,
+    attachments: Optional[List[Dict[str, str]]] = None
+) -> str:
+    msg = MIMEMultipart()
+    if sender_name:
+        msg["From"] = formataddr((sender_name, sender_email))
+    else:
+        msg["From"] = sender_email
+    msg["To"] = recipient_email
+    msg["Subject"] = subject
+    
+    # Add body
+    msg.attach(MIMEText(body, "plain"))
+    
+    # Add attachments
+    if attachments:
+        for attachment in attachments:
+            try:
+                part = MIMEBase("application", "octet-stream")
+                part.set_payload(base64.b64decode(attachment["content"]))
+                encoders.encode_base64(part)
+                part.add_header(
+                    "Content-Disposition",
+                    f"attachment; filename={attachment['filename']}",
+                )
+                msg.attach(part)
+            except Exception as e:
+                print(f"Failed to attach {attachment['filename']}: {str(e)}")
+                continue
+    
+    return msg.as_string()
+
+def send_bulk_via_smtp_blocking(sender: str, password: str, host: str, port: int, messages: List[Dict[str, Any]], delay: float = 1.0) -> Dict[str, Any]:
+    ctx = ssl.create_default_context()
+    sent = []
+    failed = []
+    
+    for m in messages:
+        try:
+            # Create a new connection for each email
+            with smtplib.SMTP_SSL(host, port, context=ctx) as server:
+                server.login(sender, password)
+                msgstr = build_message(
+                    sender, 
+                    m["to"], 
+                    m["subject"], 
+                    m["body"], 
+                    sender_name=None,
+                    attachments=m.get("attachments")
+                )
+                server.sendmail(sender, m["to"], msgstr)
+                sent.append({"email": m["to"]})
+                print(f"Sent email to {m['to']} with {len(m.get('attachments', []))} attachments")
+        except Exception as e:
+            error_msg = str(e)
+            print(f"Failed to send to {m.get('to')}: {error_msg}")
+            failed.append({"email": m.get("to"), "error": error_msg})
+        
+        if delay and delay > 0:
+            time.sleep(delay)
+    
+    return {"sent": sent, "failed": failed}
+
+async def mark_leads_sent(lead_ids: List[str]):
+    oids = []
+    for lid in lead_ids:
+        try:
+            oids.append(ObjectId(lid))
+        except Exception:
+            continue
+    if not oids:
+        return
+    await leads_col.update_many(
+        {"_id": {"$in": oids}}, 
+        {"$set": {"mail_sent": True, "last_mailed_at": datetime.utcnow()}}
+    )
+
+async def background_send(template_id: str, lead_ids: List[str], attachments: Optional[List[Dict[str, str]]] = None):
+    tmpl = await templates_col.find_one({"_id": oid(template_id)})
+    if not tmpl:
+        return {"status": "template_not_found"}
+
+    q = {"_id": {"$in": [ObjectId(l) for l in lead_ids if ObjectId.is_valid(l)]}}
+    leads_cursor = leads_col.find(q)
+    leads = []
+    async for l in leads_cursor:
+        leads.append(l)
+
+    messages = []
+    for l in leads:
+        recipient = l.get("email")
+        if not recipient or not is_valid_email(recipient):
+            continue
+        body = tmpl.get("content", "")
+        first = l["owner_name"].split()[0] if l.get("owner_name") else ""
+        body = body.replace("{First Name}", first)
+        body = body.replace("{Company}", l.get("company_name", ""))
+        subject = tmpl.get("subject", "")
+        messages.append({
+            "to": recipient, 
+            "subject": subject, 
+            "body": body,
+            "attachments": attachments  # Each message gets its own copy
+        })
+
+    if not messages:
+        return {"status": "no_valid_recipients"}
+
+    result = await asyncio.to_thread(
+        send_bulk_via_smtp_blocking, 
+        SMTP_SENDER, 
+        SMTP_PASSWORD, 
+        SMTP_HOST, 
+        SMTP_PORT, 
+        messages, 
+        SMTP_DELAY
+    )
+
+    # Update tracking of sent emails
+    sent_emails = [s["email"] for s in result.get("sent", [])]
+    sent_lead_ids = [str(l["_id"]) for l in leads if l.get("email") in sent_emails]
+    if sent_lead_ids:
+        await mark_leads_sent(sent_lead_ids)
+
+    await db["mail_logs"].insert_one({
+        "template_id": template_id,
+        "sent_count": len(result.get("sent", [])),
+        "failed": result.get("failed", []),
+        "created_at": datetime.utcnow(),
+        "had_attachments": bool(attachments)
+    })
+    return result
+
+# --------------------
+# API Endpoints
+# --------------------
+@app.post("/rephrase-email")
+async def rephrase_email(request: RephraseRequest):
+    if not rephrase_agent:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Rephrasing service not configured"
+        )
+    
+    try:
+        # Verify template exists first
+        template = await templates_col.find_one({"_id": oid(request.template_id)})
+        if not template:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Template not found"
+            )
+
+        # Run the rephrase agent
+        result = await Runner.run(
+            rephrase_agent,
+            request.content,
+            run_config=RunConfig(
+                model=rephrase_agent.model,
+                tracing_disabled=True
+            )
+        )
+        
+        rephrased_content = result.final_output.rephrased_email
+        
+        # Update the template in the database
+        update_result = await templates_col.update_one(
+            {"_id": oid(request.template_id)},
+            {"$set": {"content": rephrased_content}}
+        )
+        
+        if update_result.modified_count == 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Template not updated"
+            )
+        
+        return {
+            "success": True,
+            "rephrased_content": rephrased_content,
+            "template": serialize_doc(template)
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Rephrase error: {str(e)}")
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to rephrase email: {str(e)}"
+        )
+
 @app.get("/templates", response_model=List[TemplateOut])
 async def get_templates():
     cursor = templates_col.find().sort("created_at", -1)
@@ -136,9 +386,6 @@ async def update_template(template_id: str, payload: TemplateIn):
     new = await templates_col.find_one({"_id": oid(template_id)})
     return serialize_doc(new)
 
-# --------------------
-# Leads endpoints
-# --------------------
 @app.get("/leads", response_model=List[LeadOut])
 async def get_leads(limit: int = 100, sent: Optional[bool] = None):
     query = {"mail_sent": False}  # Default to only unsent leads
@@ -171,98 +418,6 @@ async def create_lead(payload: LeadIn):
     created = await leads_col.find_one({"_id": r.inserted_id})
     return serialize_doc(created)
 
-# --------------------
-# Email sending helpers
-# --------------------
-def build_message(sender_email: str, recipient_email: str, subject: str, body: str, sender_name: Optional[str] = None) -> str:
-    msg = MIMEMultipart()
-    if sender_name:
-        msg["From"] = formataddr((sender_name, sender_email))
-    else:
-        msg["From"] = sender_email
-    msg["To"] = recipient_email
-    msg["Subject"] = subject
-    msg.attach(MIMEText(body, "plain"))
-    return msg.as_string()
-
-def send_bulk_via_smtp_blocking(sender: str, password: str, host: str, port: int, messages: List[Dict[str, str]], delay: float = 1.0) -> Dict[str, Any]:
-    ctx = ssl.create_default_context()
-    sent = []
-    failed = []
-    try:
-        with smtplib.SMTP_SSL(host, port, context=ctx) as server:
-            server.login(sender, password)
-            for m in messages:
-                try:
-                    msgstr = build_message(sender, m["to"], m["subject"], m["body"], sender_name=None)
-                    server.sendmail(sender, m["to"], msgstr)
-                    sent.append(m["to"])
-                except Exception as e:
-                    failed.append({"email": m.get("to"), "error": str(e)})
-                if delay and delay > 0:
-                    time.sleep(delay)
-    except Exception as e:
-        failed = [{"email": m.get("to"), "error": f"smtp connection/login error: {e}"} for m in messages]
-    return {"sent": sent, "failed": failed}
-
-async def mark_leads_sent(lead_ids: List[str]):
-    oids = []
-    for lid in lead_ids:
-        try:
-            oids.append(ObjectId(lid))
-        except Exception:
-            continue
-    if not oids:
-        return
-    await leads_col.update_many(
-        {"_id": {"$in": oids}}, 
-        {"$set": {"mail_sent": True, "last_mailed_at": datetime.utcnow()}}
-    )
-
-async def background_send(template_id: str, lead_ids: List[str]):
-    tmpl = await templates_col.find_one({"_id": oid(template_id)})
-    if not tmpl:
-        return {"status": "template_not_found"}
-
-    q = {"_id": {"$in": [ObjectId(l) for l in lead_ids if ObjectId.is_valid(l)]}}
-    leads_cursor = leads_col.find(q)
-    leads = []
-    async for l in leads_cursor:
-        leads.append(l)
-
-    messages = []
-    for l in leads:
-        recipient = l.get("email")
-        if not recipient or not is_valid_email(recipient):
-            continue
-        body = tmpl.get("content", "")
-        first = l["owner_name"].split()[0] if l.get("owner_name") else ""
-        body = body.replace("{First Name}", first)
-        body = body.replace("{Company}", l.get("company_name", ""))
-        subject = tmpl.get("subject", "")
-        messages.append({"to": recipient, "subject": subject, "body": body})
-
-    if not messages:
-        return {"status": "no_valid_recipients"}
-
-    result = await asyncio.to_thread(send_bulk_via_smtp_blocking, SMTP_SENDER, SMTP_PASSWORD, SMTP_HOST, SMTP_PORT, messages, SMTP_DELAY)
-
-    sent_emails = set(result.get("sent", []))
-    sent_lead_ids = [str(l["_id"]) for l in leads if l.get("email") in sent_emails]
-    if sent_lead_ids:
-        await mark_leads_sent(sent_lead_ids)
-
-    await db["mail_logs"].insert_one({
-        "template_id": template_id,
-        "sent_count": len(result.get("sent", [])),
-        "failed": result.get("failed", []),
-        "created_at": datetime.utcnow()
-    })
-    return result
-
-# --------------------
-# Send emails endpoint
-# --------------------
 @app.post("/send-emails")
 async def send_emails(payload: SendEmailsPayload, background_tasks: BackgroundTasks):
     try:
@@ -282,7 +437,12 @@ async def send_emails(payload: SendEmailsPayload, background_tasks: BackgroundTa
     if not lead_ids:
         return JSONResponse({"status": "no_leads_to_send"}, status_code=200)
 
-    background_tasks.add_task(background_send, payload.template_id, lead_ids)
+    # Convert attachments to dict if they exist
+    attachments = None
+    if payload.attachments:
+        attachments = [a.dict() for a in payload.attachments]
+
+    background_tasks.add_task(background_send, payload.template_id, lead_ids, attachments)
     return {"status": "queued", "leads_count": len(lead_ids)}
 
 # --------------------
