@@ -19,6 +19,15 @@ export default function SendEmails() {
   const [currentEmail, setCurrentEmail] = useState(0);
   const [totalEmails, setTotalEmails] = useState(0);
   const [attachments, setAttachments] = useState([]);
+  const [emailAccounts, setEmailAccounts] = useState([]);
+  const [selectedAccounts, setSelectedAccounts] = useState([]);
+  const [showEmailAccountsModal, setShowEmailAccountsModal] = useState(false);
+  const [newEmailAccount, setNewEmailAccount] = useState({
+    email: '',
+    password: '',
+    sender_name: '',
+    daily_limit: 100
+  });
 
   useEffect(() => {
     const fetchData = async () => {
@@ -33,6 +42,11 @@ export default function SendEmails() {
         const countRes = await fetch('http://127.0.0.1:8000/leads/count');
         const countData = await countRes.json();
         setTotalLeads(countData.count);
+
+        const accountsRes = await fetch('http://127.0.0.1:8000/email-accounts');
+        const accountsData = await accountsRes.json();
+        setEmailAccounts(accountsData);
+        setSelectedAccounts(accountsData.map(acc => acc.id));
 
         setIsLoading(false);
       } catch (error) {
@@ -57,7 +71,6 @@ export default function SendEmails() {
 
       const reader = new FileReader();
       reader.onload = (event) => {
-        // This gets the base64 content after the comma
         const base64Content = event.target.result.split(',')[1];
         newAttachments.push({
           filename: file.name,
@@ -102,40 +115,56 @@ export default function SendEmails() {
 
       setTotalEmails(leadsToSend.length);
 
-      // Sequential send with 15s delay
-      for (let i = 0; i < leadsToSend.length; i++) {
-        const { lead_id, template_id } = leadsToSend[i];
+      // Send all emails at once using the new bulk endpoint
+      const response = await fetch('http://127.0.0.1:8000/send-emails', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          template_id: distribution[0].templateId, // For now, use first template
+          lead_ids: leadsToSend.map(item => item.lead_id),
+          attachments: attachments.length > 0 ? attachments : undefined,
+          email_account_ids: selectedAccounts
+        }),
+      });
 
-        await fetch('http://127.0.0.1:8000/send-emails', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            template_id,
-            lead_ids: [lead_id],
-            attachments: attachments.length > 0 ? attachments : undefined
-          }),
-        });
+      const result = await response.json();
 
-        setCurrentEmail(i + 1);
-        setProgress(Math.round(((i + 1) / leadsToSend.length) * 100));
-
-        if (i < leadsToSend.length - 1) {
-          await new Promise((resolve) => setTimeout(resolve, 15000));
+      if (result.status === 'queued') {
+        // Poll for completion (simplified - in real app, use WebSockets or better polling)
+        let attempts = 0;
+        const maxAttempts = 60; // 5 minutes max
+        
+        while (attempts < maxAttempts) {
+          await new Promise(resolve => setTimeout(resolve, 5000)); // Check every 5 seconds
+          
+          const countRes = await fetch('http://127.0.0.1:8000/leads/count');
+          const countData = await countRes.json();
+          
+          const sentCount = totalLeads - countData.count;
+          const currentProgress = Math.min(100, Math.round((sentCount / leadsToSend.length) * 100));
+          
+          setCurrentEmail(sentCount);
+          setProgress(currentProgress);
+          
+          if (sentCount >= leadsToSend.length) {
+            break;
+          }
+          
+          attempts++;
         }
+        
+        setTotalLeads(totalLeads - leadsToSend.length);
+        toast.success(`Successfully sent ${leadsToSend.length} emails`);
+      } else {
+        throw new Error(result.message || 'Failed to send emails');
       }
-
-      const verifyRes = await fetch('http://127.0.0.1:8000/leads/count');
-      const countData = await verifyRes.json();
-      setTotalLeads(countData.count);
-
-      toast.success(`Successfully sent ${leadsToSend.length} emails`);
     } catch (error) {
       toast.error(`Failed to send emails: ${error.message}`);
     } finally {
       setIsSending(false);
       setTimeout(() => {
         setShowProgressModal(false);
-      }, 1000); // Give a small delay so user can see 100% completion
+      }, 2000);
     }
   };
 
@@ -157,9 +186,7 @@ export default function SendEmails() {
 
       if (result.success) {
         setEmailContent(result.rephrased_content);
-        // Update the selected template with the new content
         setSelectedTemplate(result.template);
-        // Update the templates list
         setTemplates(templates.map(t =>
           t.id === result.template.id ? result.template : t
         ));
@@ -220,6 +247,58 @@ export default function SendEmails() {
     }
   };
 
+  const handleAddEmailAccount = async () => {
+    const toastId = toast.loading('Adding email account...');
+    try {
+      const response = await fetch('http://127.0.0.1:8000/email-accounts', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(newEmailAccount),
+      });
+
+      const savedAccount = await response.json();
+      setEmailAccounts([...emailAccounts, savedAccount]);
+      setSelectedAccounts([...selectedAccounts, savedAccount.id]);
+      setNewEmailAccount({
+        email: '',
+        password: '',
+        sender_name: '',
+        daily_limit: 100
+      });
+      toast.success('Email account added!', { id: toastId });
+    } catch (error) {
+      toast.error('Failed to add email account', { id: toastId });
+    }
+  };
+
+  const handleAccountSelection = (accountId) => {
+    if (selectedAccounts.includes(accountId)) {
+      setSelectedAccounts(selectedAccounts.filter(id => id !== accountId));
+    } else {
+      setSelectedAccounts([...selectedAccounts, accountId]);
+    }
+  };
+
+  const handleResetAccount = async (accountId) => {
+    const toastId = toast.loading('Resetting account...');
+    try {
+      await fetch(`http://127.0.0.1:8000/email-accounts/${accountId}/reset`, {
+        method: 'POST',
+      });
+      
+      // Refresh accounts
+      const accountsRes = await fetch('http://127.0.0.1:8000/email-accounts');
+      const accountsData = await accountsRes.json();
+      setEmailAccounts(accountsData);
+      
+      toast.success('Account reset successfully!', { id: toastId });
+    } catch (error) {
+      toast.error('Failed to reset account', { id: toastId });
+    }
+  };
+
   if (isLoading) {
     return (
       <div className="min-h-screen bg-gray-50 flex items-center justify-center">
@@ -242,6 +321,39 @@ export default function SendEmails() {
               <div className="p-5 border-b border-gray-200">
                 <h2 className="text-lg font-semibold text-gray-800">Available Leads</h2>
                 <div className="text-3xl font-bold text-indigo-600">{totalLeads}</div>
+              </div>
+            </div>
+
+            <div className="bg-white rounded-xl border border-gray-200 shadow-sm">
+              <div className="p-5 border-b border-gray-200">
+                <div className="flex justify-between items-center">
+                  <h2 className="text-lg font-semibold text-gray-800">Email Accounts</h2>
+                  <button
+                    onClick={() => setShowEmailAccountsModal(true)}
+                    className="text-sm text-indigo-600"
+                  >
+                    Manage
+                  </button>
+                </div>
+              </div>
+              <div className="p-5 space-y-2">
+                {emailAccounts.filter(acc => acc.is_active).slice(0, 3).map(account => (
+                  <div key={account.id} className="flex items-center justify-between text-sm">
+                    <span className="truncate">{account.email}</span>
+                    <span className={`px-2 py-1 rounded text-xs ${
+                      account.emails_sent_today >= account.daily_limit 
+                        ? 'bg-red-100 text-red-800' 
+                        : 'bg-green-100 text-green-800'
+                    }`}>
+                      {account.emails_sent_today}/{account.daily_limit}
+                    </span>
+                  </div>
+                ))}
+                {emailAccounts.filter(acc => acc.is_active).length > 3 && (
+                  <div className="text-xs text-gray-500 text-center">
+                    +{emailAccounts.filter(acc => acc.is_active).length - 3} more accounts
+                  </div>
+                )}
               </div>
             </div>
 
@@ -357,7 +469,7 @@ export default function SendEmails() {
                     </button>
                     <button
                       onClick={handleSendEmails}
-                      disabled={emailsToSend === 0 || isSending}
+                      disabled={emailsToSend === 0 || isSending || selectedAccounts.length === 0}
                       className="px-4 py-1.5 text-sm rounded-md text-white bg-indigo-600 disabled:opacity-70"
                     >
                       Send
@@ -462,6 +574,107 @@ export default function SendEmails() {
         </div>
       )}
 
+      {showEmailAccountsModal && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
+          <div className="bg-white rounded-xl max-w-2xl w-full p-6 max-h-[80vh] overflow-y-auto">
+            <div className="flex justify-between items-center mb-4">
+              <h3 className="text-lg font-bold">Manage Email Accounts</h3>
+              <button onClick={() => setShowEmailAccountsModal(false)} className="text-gray-400">
+                &times;
+              </button>
+            </div>
+
+            <div className="mb-6 p-4 bg-gray-50 rounded-lg">
+              <h4 className="font-medium mb-3">Add New Account</h4>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <input
+                  type="email"
+                  placeholder="Email address"
+                  value={newEmailAccount.email}
+                  onChange={(e) => setNewEmailAccount({...newEmailAccount, email: e.target.value})}
+                  className="rounded-md border-gray-300 shadow-sm p-2 text-sm"
+                />
+                <input
+                  type="password"
+                  placeholder="App password"
+                  value={newEmailAccount.password}
+                  onChange={(e) => setNewEmailAccount({...newEmailAccount, password: e.target.value})}
+                  className="rounded-md border-gray-300 shadow-sm p-2 text-sm"
+                />
+                <input
+                  type="text"
+                  placeholder="Sender name (optional)"
+                  value={newEmailAccount.sender_name}
+                  onChange={(e) => setNewEmailAccount({...newEmailAccount, sender_name: e.target.value})}
+                  className="rounded-md border-gray-300 shadow-sm p-2 text-sm"
+                />
+                <input
+                  type="number"
+                  placeholder="Daily limit"
+                  value={newEmailAccount.daily_limit}
+                  onChange={(e) => setNewEmailAccount({...newEmailAccount, daily_limit: parseInt(e.target.value) || 100})}
+                  className="rounded-md border-gray-300 shadow-sm p-2 text-sm"
+                />
+              </div>
+              <button
+                onClick={handleAddEmailAccount}
+                disabled={!newEmailAccount.email || !newEmailAccount.password}
+                className="mt-3 px-4 py-2 text-sm rounded-md text-white bg-indigo-600 disabled:opacity-50"
+              >
+                Add Account
+              </button>
+            </div>
+
+            <div className="space-y-3">
+              <h4 className="font-medium">Active Accounts</h4>
+              {emailAccounts.filter(acc => acc.is_active).map(account => (
+                <div key={account.id} className="flex items-center justify-between p-3 border rounded-lg">
+                  <div className="flex items-center space-x-3">
+                    <input
+                      type="checkbox"
+                      checked={selectedAccounts.includes(account.id)}
+                      onChange={() => handleAccountSelection(account.id)}
+                      className="rounded text-indigo-600"
+                    />
+                    <div>
+                      <div className="font-medium">{account.email}</div>
+                      <div className="text-sm text-gray-500">
+                        {account.sender_name && `From: ${account.sender_name} • `}
+                        Limit: {account.daily_limit}/day
+                      </div>
+                    </div>
+                  </div>
+                  <div className="flex items-center space-x-2">
+                    <span className={`px-2 py-1 rounded text-xs ${
+                      account.emails_sent_today >= account.daily_limit 
+                        ? 'bg-red-100 text-red-800' 
+                        : 'bg-green-100 text-green-800'
+                    }`}>
+                      {account.emails_sent_today}/{account.daily_limit}
+                    </span>
+                    <button
+                      onClick={() => handleResetAccount(account.id)}
+                      className="text-xs text-blue-600 hover:text-blue-800"
+                    >
+                      Reset
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <div className="mt-6 flex justify-end">
+              <button
+                onClick={() => setShowEmailAccountsModal(false)}
+                className="px-4 py-2 text-sm rounded-md text-gray-700 bg-gray-100"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {showProgressModal && (
         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
           <div className="bg-white rounded-xl max-w-md w-full p-6">
@@ -486,7 +699,7 @@ export default function SendEmails() {
 
             <div className="text-sm text-gray-500">
               {progress < 100 ? (
-                <p>Sending emails... Please don't close this window.</p>
+                <p>Sending emails using {selectedAccounts.length} accounts... Please don't close this window.</p>
               ) : (
                 <p className="text-green-600">All emails sent successfully!</p>
               )}
