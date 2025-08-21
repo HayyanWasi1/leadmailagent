@@ -1,0 +1,5 @@
+name,subject,content
+default,"Intro Outreach","Hi {First Name},\n\nI saw {Company} and wanted to connect about how we can help with your projects.\n\nBest,\n{Your Name}"
+followup,"Following up about {Company}","Hi {First Name},\n\nJust following up on my previous message about {Company}. Do you have 10 minutes for a quick chat?\n\nThanks,\n{Your Name}"
+short,"Quick question","Hi {First Name},\n\nQuick question — who handles partnerships at {Company}?\n\nRegards,\n{Your Name}"
+promo,"Special offer for {Company}","Hi {First Name},\n\nWe're offering a free audit for companies like {Company}. Interested in a short call?\n\nCheers,\n{Your Name}"
