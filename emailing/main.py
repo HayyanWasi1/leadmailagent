@@ -4,7 +4,7 @@ import asyncio
 import base64
 import traceback
 from typing import List, Optional, Any, Dict
-from datetime import datetime
+from datetime import datetime, timedelta
 from pydantic import BaseModel, Field, EmailStr
 from fastapi import FastAPI, HTTPException, BackgroundTasks, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -29,19 +29,11 @@ load_dotenv()
 # --------------------
 MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
 MONGODB_DB = os.getenv("MONGODB_DB", "email_agent_db")
-SMTP_SENDER = os.getenv("SMTP_SENDER")
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", 465))
 SMTP_DELAY = float(os.getenv("SMTP_DELAY", 15.0))  # seconds between emails in the blocking send loop
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "*")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-
-if not SMTP_SENDER or not SMTP_PASSWORD:
-    print("Warning: SMTP_SENDER or SMTP_PASSWORD not set in environment. /send-emails will fail without them.")
-
-if not GEMINI_API_KEY:
-    print("Warning: GEMINI_API_KEY not set. Email rephrasing will not work.")
 
 # --------------------
 # FastAPI + Mongo
@@ -60,6 +52,7 @@ client = motor.motor_asyncio.AsyncIOMotorClient(MONGODB_URI)
 db = client[MONGODB_DB]
 templates_col = db["templates"]
 leads_col = db["leads"]
+email_accounts_col = db["email_accounts"]
 
 # --------------------
 # Utilities
@@ -121,6 +114,22 @@ class RephraseRequest(BaseModel):
     template_id: str
     content: str
 
+class EmailAccountIn(BaseModel):
+    email: EmailStr
+    password: str
+    smtp_host: str = Field(default="smtp.gmail.com")
+    smtp_port: int = Field(default=465)
+    daily_limit: int = Field(default=100)
+    is_active: bool = Field(default=True)
+    priority: int = Field(default=1)  # Lower number = higher priority
+
+class EmailAccountOut(EmailAccountIn):
+    id: str
+    sent_today: int = 0
+    total_sent: int = 0
+    last_used: Optional[datetime] = None
+    created_at: datetime
+
 # --------------------
 # Email Rephrase Agent Setup
 # --------------------
@@ -152,6 +161,52 @@ def setup_rephrase_agent():
         return None
 
 rephrase_agent = setup_rephrase_agent()
+
+# --------------------
+# Email Account Management
+# --------------------
+async def get_next_email_account() -> Optional[Dict[str, Any]]:
+    """Get the next available email account for sending"""
+    now = datetime.utcnow()
+    today_start = datetime(now.year, now.month, now.day)
+    
+    # Find active accounts that haven't exceeded daily limit, ordered by priority
+    cursor = email_accounts_col.find({
+        "is_active": True,
+        "$or": [
+            {"sent_today": {"$lt": "$daily_limit"}},
+            {"last_used": {"$lt": today_start}}  # Reset daily count if new day
+        ]
+    }).sort([("priority", 1), ("last_used", 1)])
+    
+    accounts = []
+    async for account in cursor:
+        accounts.append(account)
+    
+    if not accounts:
+        return None
+    
+    # Reset daily count if it's a new day
+    for account in accounts:
+        if account.get("last_used") and account["last_used"] < today_start:
+            await email_accounts_col.update_one(
+                {"_id": account["_id"]},
+                {"$set": {"sent_today": 0}}
+            )
+            account["sent_today"] = 0
+    
+    return accounts[0]  # Return highest priority account
+
+async def update_email_account_stats(account_id: ObjectId, success: bool = True):
+    """Update email account statistics"""
+    update_data = {
+        "$inc": {"sent_today": 1, "total_sent": 1},
+        "$set": {"last_used": datetime.utcnow()}
+    }
+    if not success:
+        update_data["$inc"]["failed_count"] = 1
+    
+    await email_accounts_col.update_one({"_id": account_id}, update_data)
 
 # --------------------
 # Email sending helpers
@@ -193,12 +248,19 @@ def build_message(
     
     return msg.as_string()
 
-def send_bulk_via_smtp_blocking(sender: str, password: str, host: str, port: int, messages: List[Dict[str, Any]], delay: float = 1.0) -> Dict[str, Any]:
+def send_bulk_via_smtp_blocking(
+    sender: str, 
+    password: str, 
+    host: str, 
+    port: int, 
+    messages: List[Dict[str, Any]], 
+    delay: float = 1.0
+) -> Dict[str, Any]:
     ctx = ssl.create_default_context()
     sent = []
     failed = []
     
-    for m in messages:
+    for i, m in enumerate(messages):
         try:
             # Create a new connection for each email
             with smtplib.SMTP_SSL(host, port, context=ctx) as server:
@@ -208,15 +270,16 @@ def send_bulk_via_smtp_blocking(sender: str, password: str, host: str, port: int
                     m["to"], 
                     m["subject"], 
                     m["body"], 
-                    sender_name=None,
+                    sender_name=sender.split('@')[0],  # Use username as sender name
                     attachments=m.get("attachments")
                 )
                 server.sendmail(sender, m["to"], msgstr)
                 sent.append({"email": m["to"]})
-                print(f"Sent email to {m['to']} with {len(m.get('attachments', []))} attachments")
+                print(f"Sent email {i+1}/{len(messages)} to {m['to']} from {sender}")
+                
         except Exception as e:
             error_msg = str(e)
-            print(f"Failed to send to {m.get('to')}: {error_msg}")
+            print(f"Failed to send to {m.get('to')} from {sender}: {error_msg}")
             failed.append({"email": m.get("to"), "error": error_msg})
         
         if delay and delay > 0:
@@ -239,6 +302,13 @@ async def mark_leads_sent(lead_ids: List[str]):
     )
 
 async def background_send(template_id: str, lead_ids: List[str], attachments: Optional[List[Dict[str, str]]] = None):
+    # Get email account
+    email_account = await get_next_email_account()
+    if not email_account:
+        print("No available email accounts for sending")
+        return {"status": "no_email_accounts_available"}
+    
+    # Get template and leads
     tmpl = await templates_col.find_one({"_id": oid(template_id)})
     if not tmpl:
         return {"status": "template_not_found"}
@@ -263,22 +333,26 @@ async def background_send(template_id: str, lead_ids: List[str], attachments: Op
             "to": recipient, 
             "subject": subject, 
             "body": body,
-            "attachments": attachments  # Each message gets its own copy
+            "attachments": attachments
         })
 
     if not messages:
         return {"status": "no_valid_recipients"}
 
+    # Send emails using the selected account
     result = await asyncio.to_thread(
         send_bulk_via_smtp_blocking, 
-        SMTP_SENDER, 
-        SMTP_PASSWORD, 
-        SMTP_HOST, 
-        SMTP_PORT, 
+        email_account["email"],
+        email_account["password"],
+        email_account["smtp_host"],
+        email_account["smtp_port"],
         messages, 
         SMTP_DELAY
     )
-
+    
+    # Update email account stats
+    await update_email_account_stats(email_account["_id"], success=len(result.get("failed", [])) == 0)
+    
     # Update tracking of sent emails
     sent_emails = [s["email"] for s in result.get("sent", [])]
     sent_lead_ids = [str(l["_id"]) for l in leads if l.get("email") in sent_emails]
@@ -287,11 +361,13 @@ async def background_send(template_id: str, lead_ids: List[str], attachments: Op
 
     await db["mail_logs"].insert_one({
         "template_id": template_id,
+        "email_account_id": str(email_account["_id"]),
         "sent_count": len(result.get("sent", [])),
         "failed": result.get("failed", []),
         "created_at": datetime.utcnow(),
         "had_attachments": bool(attachments)
     })
+    
     return result
 
 # --------------------
@@ -362,7 +438,7 @@ async def get_templates():
         docs.append(serialize_doc(d))
     return docs
 
-@app.get("/templates/{template_id}", response_model=TemplateOut)
+@app.get("/templates/{template_id", response_model=TemplateOut)
 async def get_template(template_id: str):
     t = await templates_col.find_one({"_id": oid(template_id)})
     if not t:
@@ -388,7 +464,7 @@ async def update_template(template_id: str, payload: TemplateIn):
 
 @app.get("/leads", response_model=List[LeadOut])
 async def get_leads(limit: int = 100, sent: Optional[bool] = None):
-    query = {"mail_sent": False}  # Default to only unsent leads
+    query = {}
     if sent is not None:
         query["mail_sent"] = sent
         
@@ -402,7 +478,7 @@ async def get_leads(limit: int = 100, sent: Optional[bool] = None):
 
 @app.get("/leads/count")
 async def leads_count(sent: Optional[bool] = None):
-    query = {"mail_sent": False}  # Default to only unsent leads
+    query = {}
     if sent is not None:
         query["mail_sent"] = sent
         
@@ -446,6 +522,222 @@ async def send_emails(payload: SendEmailsPayload, background_tasks: BackgroundTa
     return {"status": "queued", "leads_count": len(lead_ids)}
 
 # --------------------
+# Email Accounts Endpoints
+# --------------------
+@app.post("/email-accounts", response_model=EmailAccountOut, status_code=status.HTTP_201_CREATED)
+async def create_email_account(payload: EmailAccountIn):
+    doc = payload.dict()
+    doc["sent_today"] = 0
+    doc["total_sent"] = 0
+    doc["created_at"] = datetime.utcnow()
+    r = await email_accounts_col.insert_one(doc)
+    created = await email_accounts_col.find_one({"_id": r.inserted_id})
+    return serialize_doc(created)
+
+@app.get("/email-accounts", response_model=List[EmailAccountOut])
+async def get_email_accounts():
+    cursor = email_accounts_col.find().sort("priority", 1)
+    docs = []
+    async for d in cursor:
+        docs.append(serialize_doc(d))
+    return docs
+
+@app.put("/email-accounts/{account_id}", response_model=EmailAccountOut)
+async def update_email_account(account_id: str, payload: EmailAccountIn):
+    update_doc = {"$set": payload.dict()}
+    res = await email_accounts_col.update_one({"_id": oid(account_id)}, update_doc)
+    if res.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Email account not found")
+    updated = await email_accounts_col.find_one({"_id": oid(account_id)})
+    return serialize_doc(updated)
+
+@app.get("/email-accounts/stats")
+async def get_email_accounts_stats():
+    """Get statistics for all email accounts"""
+    cursor = email_accounts_col.find().sort("priority", 1)
+    accounts = []
+    async for account in cursor:
+        accounts.append(serialize_doc(account))
+    
+    # Get today's stats
+    today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    pipeline = [
+        {"$match": {"created_at": {"$gte": today_start}}},
+        {"$group": {
+            "_id": "$email_account_id",
+            "today_sent": {"$sum": "$sent_count"},
+            "today_failed": {"$sum": {"$size": "$failed"}}
+        }}
+    ]
+    
+    today_stats = {}
+    async for stat in db["mail_logs"].aggregate(pipeline):
+        today_stats[stat["_id"]] = stat
+    
+    # Combine stats
+    for account in accounts:
+        account_id = account["id"]
+        if account_id in today_stats:
+            account["today_sent"] = today_stats[account_id]["today_sent"]
+            account["today_failed"] = today_stats[account_id]["today_failed"]
+        else:
+            account["today_sent"] = 0
+            account["today_failed"] = 0
+    
+    return accounts
+
+# --------------------
+# Analytics Endpoints
+# --------------------
+@app.get("/analytics/daily-stats")
+async def get_daily_stats(days: int = 30):
+    """Get daily statistics for leads and emails"""
+    end_date = datetime.utcnow()
+    start_date = end_date - timedelta(days=days)
+    
+    # Get daily lead counts
+    lead_pipeline = [
+        {"$match": {"created_at": {"$gte": start_date, "$lte": end_date}}},
+        {"$group": {
+            "_id": {"$dateToString": {"format": "%Y-%m-%d", "date": "$created_at"}},
+            "leads_count": {"$sum": 1}
+        }},
+        {"$sort": {"_id": 1}}
+    ]
+    
+    # Get daily email counts from mail_logs
+    email_pipeline = [
+        {"$match": {"created_at": {"$gte": start_date, "$lte": end_date}}},
+        {"$group": {
+            "_id": {"$dateToString": {"format": "%Y-%m-%d", "date": "$created_at"}},
+            "emails_sent": {"$sum": "$sent_count"},
+            "emails_failed": {"$sum": {"$size": "$failed"}}
+        }},
+        {"$sort": {"_id": 1}}
+    ]
+    
+    lead_stats = await db.leads.aggregate(lead_pipeline).to_list(None)
+    email_stats = await db.mail_logs.aggregate(email_pipeline).to_list(None)
+    
+    # Convert to dictionaries for easier merging
+    leads_dict = {stat["_id"]: stat["leads_count"] for stat in lead_stats}
+    emails_dict = {stat["_id"]: stat["emails_sent"] for stat in email_stats}
+    
+    # Generate all dates in range
+    all_dates = []
+    current_date = start_date
+    while current_date <= end_date:
+        date_str = current_date.strftime("%Y-%m-%d")
+        all_dates.append(date_str)
+        current_date += timedelta(days=1)
+    
+    # Build complete dataset
+    result = []
+    for date_str in all_dates:
+        result.append({
+            "date": date_str,
+            "leads": leads_dict.get(date_str, 0),
+            "emails_sent": emails_dict.get(date_str, 0)
+        })
+    
+    return result
+
+@app.get("/analytics/summary")
+async def get_analytics_summary():
+    """Get overall analytics summary"""
+    total_leads = await leads_col.count_documents({})
+    unsent_leads = await leads_col.count_documents({"mail_sent": False})
+    sent_leads = total_leads - unsent_leads
+    
+    # Get email stats from mail_logs
+    email_stats = await db.mail_logs.aggregate([
+        {"$group": {
+            "_id": None,
+            "total_sent": {"$sum": "$sent_count"},
+            "total_failed": {"$sum": {"$size": "$failed"}}
+        }}
+    ]).to_list(None)
+    
+    total_emails_sent = email_stats[0]["total_sent"] if email_stats else 0
+    total_emails_failed = email_stats[0]["total_failed"] if email_stats else 0
+    
+    return {
+        "total_leads": total_leads,
+        "sent_leads": sent_leads,
+        "unsent_leads": unsent_leads,
+        "total_emails_sent": total_emails_sent,
+        "total_emails_failed": total_emails_failed,
+        "success_rate": (total_emails_sent / (total_emails_sent + total_emails_failed)) * 100 if (total_emails_sent + total_emails_failed) > 0 else 100
+    }
+
+# --------------------
+# Bing Maps Scraping Endpoints
+# --------------------
+class ScrapeRequest(BaseModel):
+    query: str
+    max_businesses: int
+
+class ScrapeResponse(BaseModel):
+    status: str
+    message: str
+    scraped_count: int = 0
+    total_requested: int = 0
+
+@app.post("/scrape-bing-maps", response_model=ScrapeResponse)
+async def scrape_bing_maps_endpoint(request: ScrapeRequest, background_tasks: BackgroundTasks):
+    try:
+        # Start the scraping in the background
+        background_tasks.add_task(
+            save_scraped_data_to_db,
+            request.query,
+            request.max_businesses
+        )
+        
+        return {
+            "status": "started",
+            "message": f"Scraping started for '{request.query}'. Results will be saved to database.",
+            "total_requested": request.max_businesses
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+async def save_scraped_data_to_db(query: str, max_businesses: int):
+    """Background task that performs scraping and saves to DB"""
+    try:
+        # Import here to avoid circular imports
+        from scraper import scrape_bing_maps
+        
+        results = scrape_bing_maps(query, max_businesses)
+        
+        # Convert to lead format for your database
+        leads_to_insert = []
+        for business in results:
+            lead = {
+                "company_name": business.shop_name,
+                "contact_number": business.phone,
+                "email": business.emails[0] if business.emails else None,
+                "owner_name": "",  # Can't get this from Bing Maps
+                "mail_sent": False,
+                "created_at": datetime.utcnow(),
+                "source": "bing_maps_scraper",
+                "website": business.website,
+                "additional_info": {
+                    "website_name": business.website_name,
+                    "all_emails": business.emails,
+                    "scraped_with_proxy": business.proxy_used
+                }
+            }
+            leads_to_insert.append(lead)
+        
+        if leads_to_insert:
+            await leads_col.insert_many(leads_to_insert)
+            print(f"✅ Saved {len(leads_to_insert)} leads to database")
+        
+    except Exception as e:
+        print(f"❌ Error in background scraping task: {str(e)}")
+        traceback.print_exc()
+
+# --------------------
 # Dev endpoints
 # --------------------
 @app.post("/_dev/seed")
@@ -465,6 +757,12 @@ async def seed_dev():
         {"company_name": "Beta Co", "contact_number": "03127654321", "email": "lead2@example.com", "owner_name": "Sara Ahmed", "mail_sent": False, "created_at": datetime.utcnow()},
     ]
     await leads_col.insert_many(sample_leads)
+    
+    # Seed sample email accounts if none exist
+    email_count = await email_accounts_col.count_documents({})
+    if email_count == 0:
+        print("No email accounts found. Please add email accounts through the API.")
+    
     return {"status": "seeded"}
 
 @app.get("/")
