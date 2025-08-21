@@ -24,6 +24,7 @@ import time
 from agents import Agent, Runner, AsyncOpenAI, OpenAIChatCompletionsModel
 from agents.run import RunConfig
 
+
 load_dotenv()
 
 # --------------------
