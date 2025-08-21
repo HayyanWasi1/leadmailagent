@@ -834,3 +834,91 @@ async def seed_dev():
 @app.get("/")
 async def root():
     return {"status": "ok", "db": MONGODB_DB}
+
+from datetime import datetime, timedelta
+from collections import defaultdict
+
+# Add these endpoints after the existing API endpoints
+@app.get("/analytics/daily-stats")
+async def get_daily_stats(days: int = 30):
+    """Get daily statistics for leads created and emails sent"""
+    end_date = datetime.utcnow()
+    start_date = end_date - timedelta(days=days)
+    
+    # Get daily lead creation stats
+    pipeline_leads = [
+        {"$match": {"created_at": {"$gte": start_date, "$lte": end_date}}},
+        {"$group": {
+            "_id": {"$dateToString": {"format": "%Y-%m-%d", "date": "$created_at"}},
+            "leads_created": {"$sum": 1}
+        }},
+        {"$sort": {"_id": 1}}
+    ]
+    
+    # Get daily email sending stats
+    pipeline_emails = [
+        {"$match": {"created_at": {"$gte": start_date, "$lte": end_date}}},
+        {"$group": {
+            "_id": {"$dateToString": {"format": "%Y-%m-%d", "date": "$created_at"}},
+            "emails_sent": {"$sum": "$sent_count"},
+            "emails_failed": {"$sum": {"$size": "$failed"}}
+        }},
+        {"$sort": {"_id": 1}}
+    ]
+    
+    leads_cursor = leads_col.aggregate(pipeline_leads)
+    emails_cursor = db["mail_logs"].aggregate(pipeline_emails)
+    
+    leads_stats = await leads_cursor.to_list(length=None)
+    emails_stats = await emails_cursor.to_list(length=None)
+    
+    # Convert to dictionaries for easier merging
+    leads_dict = {stat["_id"]: stat["leads_created"] for stat in leads_stats}
+    emails_dict = {stat["_id"]: stat["emails_sent"] for stat in emails_stats}
+    
+    # Generate all dates in the range
+    all_dates = []
+    current_date = start_date
+    while current_date <= end_date:
+        date_str = current_date.strftime("%Y-%m-%d")
+        all_dates.append(date_str)
+        current_date += timedelta(days=1)
+    
+    # Build complete dataset
+    result = []
+    for date_str in all_dates:
+        result.append({
+            "date": date_str,
+            "leads_created": leads_dict.get(date_str, 0),
+            "emails_sent": emails_dict.get(date_str, 0)
+        })
+    
+    return result
+
+@app.get("/analytics/summary")
+async def get_analytics_summary():
+    """Get overall analytics summary"""
+    total_leads = await leads_col.count_documents({})
+    total_sent_leads = await leads_col.count_documents({"mail_sent": True})
+    total_unsent_leads = await leads_col.count_documents({"mail_sent": False})
+    
+    # Get total emails sent from mail_logs
+    pipeline = [
+        {"$group": {
+            "_id": None,
+            "total_emails_sent": {"$sum": "$sent_count"},
+            "total_emails_failed": {"$sum": {"$size": "$failed"}}
+        }}
+    ]
+    
+    email_stats = await db["mail_logs"].aggregate(pipeline).to_list(length=1)
+    email_stats = email_stats[0] if email_stats else {"total_emails_sent": 0, "total_emails_failed": 0}
+    
+    return {
+        "total_leads": total_leads,
+        "sent_leads": total_sent_leads,
+        "unsent_leads": total_unsent_leads,
+        "total_emails_sent": email_stats["total_emails_sent"],
+        "total_emails_failed": email_stats["total_emails_failed"],
+        "success_rate": (email_stats["total_emails_sent"] / (email_stats["total_emails_sent"] + email_stats["total_emails_failed"])) * 100 if (email_stats["total_emails_sent"] + email_stats["total_emails_failed"]) > 0 else 100
+    }
