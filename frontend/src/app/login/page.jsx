@@ -2,12 +2,9 @@
 import React, { useState } from 'react';
 
 const LoginPage = () => {
-  const [isLogin, setIsLogin] = useState(true);
   const [formData, setFormData] = useState({
-    username: '',
-    password: '',
     email: '',
-    full_name: ''
+    password: ''
   });
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState('');
@@ -29,62 +26,32 @@ const LoginPage = () => {
     setSuccess('');
 
     try {
-      if (isLogin) {
-        // Login logic - use URLSearchParams instead of FormData for x-www-form-urlencoded
-        const params = new URLSearchParams();
-        params.append('username', formData.username);
-        params.append('password', formData.password);
-        
-        const response = await fetch('http://127.0.0.1:8000/token', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/x-www-form-urlencoded',
-          },
-          body: params.toString()
-        });
+      // Build FormData for FastAPI OAuth2PasswordRequestForm
+      const body = new FormData();
+      body.append('username', formData.email);
+      body.append('password', formData.password);
 
-        if (response.ok) {
-          const data = await response.json();
-          localStorage.setItem('token', data.access_token);
-          setSuccess('Login successful! Redirecting...');
-          // Redirect to dashboard or main app
-          setTimeout(() => {
-            window.location.href = '/dashboard';
-          }, 1500);
-        } else {
-          try {
-            const errorData = await response.json();
-            setError(errorData.detail || 'Login failed');
-          } catch (jsonError) {
-            setError(`Login failed: ${response.status} ${response.statusText}`);
-          }
-        }
+      console.log([...body.entries()]); // ✅ Shows actual key/value pairs
+
+      const response = await fetch('http://127.0.0.1:8000/login', {
+        method: 'POST',
+        body: body, // send FormData
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        localStorage.setItem('token', data.access_token);
+        setSuccess('Login successful! Redirecting...');
+        // Redirect after short delay
+        setTimeout(() => {
+          window.location.href = '/dashboard';
+        }, 1500);
       } else {
-        // Register logic
-        const response = await fetch('http://127.0.0.1:8000/users/', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            username: formData.username,
-            password: formData.password,
-            email: formData.email,
-            full_name: formData.full_name
-          })
-        });
-
-        if (response.ok) {
-          setSuccess('Registration successful! You can now login.');
-          setIsLogin(true);
-          setFormData({ username: '', password: '', email: '', full_name: '' });
-        } else {
-          try {
-            const errorData = await response.json();
-            setError(errorData.detail || 'Registration failed');
-          } catch (jsonError) {
-            setError(`Registration failed: ${response.status} ${response.statusText}`);
-          }
+        try {
+          const errorData = await response.json();
+          setError(errorData.detail || 'Login failed');
+        } catch (jsonError) {
+          setError(`Login failed: ${response.status} ${response.statusText}`);
         }
       }
     } catch (error) {
@@ -95,31 +62,22 @@ const LoginPage = () => {
     }
   };
 
-  const toggleMode = () => {
-    setIsLogin(!isLogin);
-    setFormData({ username: '', password: '', email: '', full_name: '' });
-    setError('');
-    setSuccess('');
-  };
-
-  // Test the connection to backend
+  // Test backend connection
   const testConnection = async () => {
     try {
       const response = await fetch('http://127.0.0.1:8000/');
       if (response.ok) {
         console.log('Backend connection successful');
+        alert('Backend connection successful!');
       } else {
         console.log('Backend connection failed');
+        alert('Backend connection failed!');
       }
     } catch (error) {
       console.error('Backend connection test failed:', error);
+      alert('Backend connection test failed!');
     }
   };
-
-  // Test connection on component mount
-  React.useEffect(() => {
-    testConnection();
-  }, []);
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 flex items-center justify-center py-12 px-4 sm:px-6 lg:px-8">
@@ -131,17 +89,8 @@ const LoginPage = () => {
             </svg>
           </div>
           <h2 className="mt-6 text-3xl font-extrabold text-gray-900">
-            {isLogin ? 'Sign in to your account' : 'Create new account'}
+            Sign in to your account
           </h2>
-          <p className="mt-2 text-sm text-gray-600">
-            {isLogin ? "Don't have an account? " : "Already have an account? "}
-            <button
-              onClick={toggleMode}
-              className="font-medium text-indigo-600 hover:text-indigo-500 focus:outline-none focus:underline transition ease-in-out duration-150"
-            >
-              {isLogin ? 'Sign up here' : 'Sign in here'}
-            </button>
-          </p>
         </div>
 
         <form className="mt-8 space-y-6" onSubmit={handleSubmit}>
@@ -162,54 +111,20 @@ const LoginPage = () => {
 
           <div className="rounded-md shadow-sm space-y-4">
             <div>
-              <label htmlFor="username" className="block text-sm font-medium text-gray-700 mb-1">
-                Username
+              <label htmlFor="email" className="block text-sm font-medium text-gray-700 mb-1">
+                Email
               </label>
               <input
-                id="username"
-                name="username"
-                type="text"
+                id="email"
+                name="email"
+                type="email"
                 required
-                value={formData.username}
+                value={formData.email}
                 onChange={handleInputChange}
-                className="relative block w-full px-3 py-2 border border-gray-300 placeholder-gray-500 text-gray-900 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 focus:z-10 sm:text-sm transition-colors duration-200"
-                placeholder="Enter your username"
+                className="relative block w-full px-3 py-2 border border-gray-300 placeholder-gray-500 text-gray-900 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm transition-colors duration-200"
+                placeholder="Enter your email"
               />
             </div>
-
-            {!isLogin && (
-              <>
-                <div>
-                  <label htmlFor="email" className="block text-sm font-medium text-gray-700 mb-1">
-                    Email (optional)
-                  </label>
-                  <input
-                    id="email"
-                    name="email"
-                    type="email"
-                    value={formData.email}
-                    onChange={handleInputChange}
-                    className="relative block w-full px-3 py-2 border border-gray-300 placeholder-gray-500 text-gray-900 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 focus:z-10 sm:text-sm transition-colors duration-200"
-                    placeholder="Enter your email"
-                  />
-                </div>
-
-                <div>
-                  <label htmlFor="full_name" className="block text-sm font-medium text-gray-700 mb-1">
-                    Full Name (optional)
-                  </label>
-                  <input
-                    id="full_name"
-                    name="full_name"
-                    type="text"
-                    value={formData.full_name}
-                    onChange={handleInputChange}
-                    className="relative block w-full px-3 py-2 border border-gray-300 placeholder-gray-500 text-gray-900 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 focus:z-10 sm:text-sm transition-colors duration-200"
-                    placeholder="Enter your full name"
-                  />
-                </div>
-              </>
-            )}
 
             <div>
               <label htmlFor="password" className="block text-sm font-medium text-gray-700 mb-1">
@@ -222,33 +137,31 @@ const LoginPage = () => {
                 required
                 value={formData.password}
                 onChange={handleInputChange}
-                className="relative block w-full px-3 py-2 border border-gray-300 placeholder-gray-500 text-gray-900 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 focus:z-10 sm:text-sm transition-colors duration-200"
+                className="relative block w-full px-3 py-2 border border-gray-300 placeholder-gray-500 text-gray-900 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm transition-colors duration-200"
                 placeholder="Enter your password"
               />
             </div>
           </div>
 
-          {isLogin && (
-            <div className="flex items-center justify-between">
-              <div className="flex items-center">
-                <input
-                  id="remember-me"
-                  name="remember-me"
-                  type="checkbox"
-                  className="h-4 w-4 text-indigo-600 focus:ring-indigo-500 border-gray-300 rounded"
-                />
-                <label htmlFor="remember-me" className="ml-2 block text-sm text-gray-900">
-                  Remember me
-                </label>
-              </div>
-
-              <div className="text-sm">
-                <a href="#" className="font-medium text-indigo-600 hover:text-indigo-500">
-                  Forgot your password?
-                </a>
-              </div>
+          <div className="flex items-center justify-between">
+            <div className="flex items-center">
+              <input
+                id="remember-me"
+                name="remember-me"
+                type="checkbox"
+                className="h-4 w-4 text-indigo-600 focus:ring-indigo-500 border-gray-300 rounded"
+              />
+              <label htmlFor="remember-me" className="ml-2 block text-sm text-gray-900">
+                Remember me
+              </label>
             </div>
-          )}
+
+            <div className="text-sm">
+              <a href="#" className="font-medium text-indigo-600 hover:text-indigo-500">
+                Forgot your password?
+              </a>
+            </div>
+          </div>
 
           <div>
             <button
@@ -262,10 +175,10 @@ const LoginPage = () => {
                     <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
                     <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
                   </svg>
-                  {isLogin ? 'Signing in...' : 'Creating account...'}
+                  Signing in...
                 </div>
               ) : (
-                <span>{isLogin ? 'Sign in' : 'Create account'}</span>
+                <span>Sign in</span>
               )}
             </button>
           </div>
@@ -280,11 +193,11 @@ const LoginPage = () => {
               <span className="px-2 bg-white text-gray-500">Demo Credentials</span>
             </div>
           </div>
-          
+
           <div className="mt-4 bg-gray-50 p-4 rounded-lg">
             <p className="text-sm text-gray-600 text-center">
-              <strong>Username:</strong> admin<br />
-              <strong>Password:</strong> admin
+              <strong>Email:</strong> admin@example.com<br />
+              <strong>Password:</strong> password123
             </p>
             <p className="text-xs text-gray-500 mt-2 text-center">
               Make sure to run the seed endpoint first: POST /_dev/seed

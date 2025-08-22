@@ -8,7 +8,8 @@ from typing import List, Optional, Any, Dict
 from datetime import timedelta
 from datetime import datetime
 from pydantic import BaseModel, Field, EmailStr, validator
-from fastapi import FastAPI, HTTPException, BackgroundTasks, status
+from fastapi import FastAPI, HTTPException, BackgroundTasks, status, Depends
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
@@ -23,7 +24,8 @@ from email.mime.base import MIMEBase
 import time
 from agents import Agent, Runner, AsyncOpenAI, OpenAIChatCompletionsModel
 from agents.run import RunConfig
-
+from passlib.context import CryptContext
+from jose import JWTError, jwt
 
 load_dotenv()
 
@@ -37,6 +39,9 @@ SMTP_PORT = int(os.getenv("SMTP_PORT", 465))
 SMTP_DELAY = float(os.getenv("SMTP_DELAY", 15.0))  # seconds between emails in the blocking send loop
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "*")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+SECRET_KEY = os.getenv("SECRET_KEY", "supersecretkey123")  # 🔐 change in production
+ALGORITHM = os.getenv("ALGORITHM", "HS256")
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", 60 * 24 * 30))  # 30 days
 
 if not GEMINI_API_KEY:
     print("Warning: GEMINI_API_KEY not set. Email rephrasing will not work.")
@@ -60,6 +65,47 @@ templates_col = db["templates"]
 leads_col = db["leads"]
 email_accounts_col = db["email_accounts"]
 mail_logs_col = db["mail_logs"]
+users_collection = db["users"]
+
+# --------------------
+# Authentication
+# --------------------
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password):
+    return pwd_context.hash(password)
+
+def create_access_token(data: dict, expires_delta: timedelta | None = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+async def get_current_user(token: str = Depends(oauth2_scheme)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        email: str = payload.get("sub")
+        if email is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+    
+    user = await users_collection.find_one({"email": email})
+    if user is None:
+        raise credentials_exception
+    return user
 
 # --------------------
 # Utilities
@@ -85,6 +131,14 @@ def serialize_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
 # --------------------
 # Pydantic models
 # --------------------
+class UserCreate(BaseModel):
+    email: EmailStr
+    password: str
+
+class UserOut(BaseModel):
+    id: str
+    email: EmailStr
+
 class TemplateIn(BaseModel):
     name: str = Field(..., example="Default")
     subject: str = Field(..., example="Hello from Acme")
@@ -93,6 +147,7 @@ class TemplateIn(BaseModel):
 class TemplateOut(TemplateIn):
     id: str
     created_at: datetime
+    user_id: str
 
 class LeadIn(BaseModel):
     company_name: Optional[str] = None
@@ -104,6 +159,7 @@ class LeadOut(LeadIn):
     id: str
     mail_sent: bool = False
     created_at: datetime
+    user_id: str
 
 class Attachment(BaseModel):
     filename: str
@@ -121,6 +177,7 @@ class EmailAccountOut(EmailAccountIn):
     created_at: datetime
     emails_sent_today: int = 0
     last_reset_date: datetime
+    user_id: str
 
 class SendEmailsPayload(BaseModel):
     template_id: str
@@ -144,6 +201,10 @@ class ScrapeResponse(BaseModel):
     message: str
     scraped_count: int = 0
     total_requested: int = 0
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
 
 # --------------------
 # Email Rephrase Agent Setup
@@ -180,13 +241,14 @@ rephrase_agent = setup_rephrase_agent()
 # --------------------
 # Email Account Management
 # --------------------
-async def get_available_email_accounts() -> List[Dict[str, Any]]:
-    """Get all active email accounts that haven't reached their daily limit"""
+async def get_available_email_accounts(user_id: str) -> List[Dict[str, Any]]:
+    """Get all active email accounts that haven't reached their daily limit for a specific user"""
     # First, check if we need to reset daily counts
     today = datetime.utcnow().date()
     
     # Find accounts that need reset
     accounts_to_reset = await email_accounts_col.find({
+        "user_id": user_id,
         "last_reset_date": {"$lt": datetime(today.year, today.month, today.day)}
     }).to_list(length=None)
     
@@ -199,6 +261,7 @@ async def get_available_email_accounts() -> List[Dict[str, Any]]:
     
     # Get all active accounts that haven't reached their daily limit
     cursor = email_accounts_col.find({
+        "user_id": user_id,
         "is_active": True,
         "emails_sent_today": {"$lt": "$daily_limit"}
     })
@@ -215,6 +278,59 @@ async def update_email_account_usage(account_id: ObjectId, emails_sent: int):
         {"_id": account_id},
         {"$inc": {"emails_sent_today": emails_sent}}
     )
+
+# --------------------
+# Authentication Endpoints
+# --------------------
+@app.post("/login", response_model=Token)
+async def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    print(f"Login attempt for username: {form_data.username}")  # Debug
+    
+    user = await users_collection.find_one({"email": form_data.username})
+    print(f"User found: {user}")  # Debug
+    
+    if not user:
+        print("User not found in database")  # Debug
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid email or password",
+        )
+    
+    # Debug password verification
+    print(f"Stored hash: {user.get('password')}")  # Debug
+    password_valid = verify_password(form_data.password, user["password"])
+    print(f"Password valid: {password_valid}")  # Debug
+    
+    if not password_valid:
+        print("Password verification failed")  # Debug
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid email or password",
+        )
+    
+    access_token = create_access_token({"sub": user["email"]})
+    return {"access_token": access_token, "token_type": "bearer"}
+
+@app.post("/signup", response_model=UserOut)
+async def signup(user: UserCreate):
+    # Check if user already exists
+    existing_user = await users_collection.find_one({"email": user.email})
+    if existing_user:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Email already registered"
+        )
+    
+    # Create new user
+    hashed_password = get_password_hash(user.password)
+    user_dict = {
+        "email": user.email,
+        "password": hashed_password,
+        "created_at": datetime.utcnow()
+    }
+    
+    result = await users_collection.insert_one(user_dict)
+    return {"id": str(result.inserted_id), "email": user.email}
 
 # --------------------
 # Email sending helpers
@@ -348,7 +464,7 @@ def send_bulk_via_smtp_blocking(
     
     return {"sent": sent, "failed": failed, "account_usage": account_usage}
 
-async def mark_leads_sent(lead_ids: List[str]):
+async def mark_leads_sent(lead_ids: List[str], user_id: str):
     oids = []
     for lid in lead_ids:
         try:
@@ -358,16 +474,16 @@ async def mark_leads_sent(lead_ids: List[str]):
     if not oids:
         return
     await leads_col.update_many(
-        {"_id": {"$in": oids}}, 
+        {"_id": {"$in": oids}, "user_id": user_id}, 
         {"$set": {"mail_sent": True, "last_mailed_at": datetime.utcnow()}}
     )
 
-async def background_send(template_id: str, lead_ids: List[str], attachments: Optional[List[Dict[str, str]]] = None, email_account_ids: Optional[List[str]] = None):
-    tmpl = await templates_col.find_one({"_id": oid(template_id)})
+async def background_send(template_id: str, lead_ids: List[str], user_id: str, attachments: Optional[List[Dict[str, str]]] = None, email_account_ids: Optional[List[str]] = None):
+    tmpl = await templates_col.find_one({"_id": oid(template_id), "user_id": user_id})
     if not tmpl:
         return {"status": "template_not_found"}
 
-    q = {"_id": {"$in": [ObjectId(l) for l in lead_ids if ObjectId.is_valid(l)]}}
+    q = {"_id": {"$in": [ObjectId(l) for l in lead_ids if ObjectId.is_valid(l)]}, "user_id": user_id}
     leads_cursor = leads_col.find(q)
     leads = []
     async for l in leads_cursor:
@@ -399,11 +515,12 @@ async def background_send(template_id: str, lead_ids: List[str], attachments: Op
         account_oids = [ObjectId(acc_id) for acc_id in email_account_ids if ObjectId.is_valid(acc_id)]
         email_accounts = await email_accounts_col.find({
             "_id": {"$in": account_oids},
+            "user_id": user_id,
             "is_active": True
         }).to_list(length=None)
     else:
-        # Use all available accounts
-        email_accounts = await get_available_email_accounts()
+        # Use all available accounts for this user
+        email_accounts = await get_available_email_accounts(user_id)
     
     if not email_accounts:
         return {"status": "no_valid_accounts", "message": "No active email accounts available"}
@@ -419,7 +536,7 @@ async def background_send(template_id: str, lead_ids: List[str], attachments: Op
     sent_emails = [s["email"] for s in result.get("sent", [])]
     sent_lead_ids = [str(l["_id"]) for l in leads if l.get("email") in sent_emails]
     if sent_lead_ids:
-        await mark_leads_sent(sent_lead_ids)
+        await mark_leads_sent(sent_lead_ids, user_id)
     
     # Update account usage counts
     for account_id, count in result.get("account_usage", {}).items():
@@ -428,6 +545,7 @@ async def background_send(template_id: str, lead_ids: List[str], attachments: Op
 
     await mail_logs_col.insert_one({
         "template_id": template_id,
+        "user_id": user_id,
         "sent_count": len(result.get("sent", [])),
         "failed": result.get("failed", []),
         "created_at": datetime.utcnow(),
@@ -437,10 +555,10 @@ async def background_send(template_id: str, lead_ids: List[str], attachments: Op
     return result
 
 # --------------------
-# API Endpoints
+# API Endpoints (All require authentication)
 # --------------------
 @app.post("/rephrase-email")
-async def rephrase_email(request: RephraseRequest):
+async def rephrase_email(request: RephraseRequest, current_user: dict = Depends(get_current_user)):
     if not rephrase_agent:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -448,8 +566,8 @@ async def rephrase_email(request: RephraseRequest):
         )
     
     try:
-        # Verify template exists first
-        template = await templates_col.find_one({"_id": oid(request.template_id)})
+        # Verify template exists first and belongs to user
+        template = await templates_col.find_one({"_id": oid(request.template_id), "user_id": current_user["_id"]})
         if not template:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -470,7 +588,7 @@ async def rephrase_email(request: RephraseRequest):
         
         # Update the template in the database
         update_result = await templates_col.update_one(
-            {"_id": oid(request.template_id)},
+            {"_id": oid(request.template_id), "user_id": current_user["_id"]},
             {"$set": {"content": rephrased_content}}
         )
         
@@ -497,42 +615,45 @@ async def rephrase_email(request: RephraseRequest):
         )
 
 @app.get("/templates", response_model=List[TemplateOut])
-async def get_templates():
-    cursor = templates_col.find().sort("created_at", -1)
+async def get_templates(current_user: dict = Depends(get_current_user)):
+    cursor = templates_col.find({"user_id": str(current_user["_id"])}).sort("created_at", -1)
     docs = []
     async for d in cursor:
         docs.append(serialize_doc(d))
     return docs
 
 @app.get("/templates/{template_id}", response_model=TemplateOut)
-async def get_template(template_id: str):
-    t = await templates_col.find_one({"_id": oid(template_id)})
+async def get_template(template_id: str, current_user: dict = Depends(get_current_user)):
+    t = await templates_col.find_one({"_id": oid(template_id), "user_id": str(current_user["_id"])})
     if not t:
         raise HTTPException(status_code=404, detail="Template not found")
     return serialize_doc(t)
 
 @app.post("/templates", response_model=TemplateOut, status_code=status.HTTP_201_CREATED)
-async def create_template(payload: TemplateIn):
+async def create_template(payload: TemplateIn, current_user: dict = Depends(get_current_user)):
     doc = payload.dict()
     doc["created_at"] = datetime.utcnow()
+    doc["user_id"] = str(current_user["_id"])
     r = await templates_col.insert_one(doc)
     created = await templates_col.find_one({"_id": r.inserted_id})
     return serialize_doc(created)
 
 @app.put("/templates/{template_id}", response_model=TemplateOut)
-async def update_template(template_id: str, payload: TemplateIn):
+async def update_template(template_id: str, payload: TemplateIn, current_user: dict = Depends(get_current_user)):
     update_doc = {"$set": payload.dict()}
-    res = await templates_col.update_one({"_id": oid(template_id)}, update_doc)
+    res = await templates_col.update_one({"_id": oid(template_id), "user_id": str(current_user["_id"])}, update_doc)
     if res.matched_count == 0:
         raise HTTPException(status_code=404, detail="Template not found")
     new = await templates_col.find_one({"_id": oid(template_id)})
     return serialize_doc(new)
 
 @app.get("/leads", response_model=List[LeadOut])
-async def get_leads(limit: int = 100, sent: Optional[bool] = None):
-    query = {"mail_sent": False}  # Default to only unsent leads
+async def get_leads(limit: int = 100, sent: Optional[bool] = None, current_user: dict = Depends(get_current_user)):
+    query = {"user_id": str(current_user["_id"])}
     if sent is not None:
         query["mail_sent"] = sent
+    else:
+        query["mail_sent"] = False  # Default to only unsent leads
         
     cursor = leads_col.find(query).sort("created_at", -1).limit(limit)
     out = []
@@ -543,8 +664,8 @@ async def get_leads(limit: int = 100, sent: Optional[bool] = None):
     return out
 
 @app.get("/leads/count")
-async def leads_count(sent: Optional[bool] = None):
-    query = {"mail_sent": False}  # Default to only unsent leads
+async def leads_count(sent: Optional[bool] = None, current_user: dict = Depends(get_current_user)):
+    query = {"user_id": str(current_user["_id"])}
     if sent is not None:
         query["mail_sent"] = sent
         
@@ -552,18 +673,19 @@ async def leads_count(sent: Optional[bool] = None):
     return {"count": count}
 
 @app.post("/leads", response_model=LeadOut, status_code=status.HTTP_201_CREATED)
-async def create_lead(payload: LeadIn):
+async def create_lead(payload: LeadIn, current_user: dict = Depends(get_current_user)):
     doc = payload.dict()
     doc["mail_sent"] = False
     doc["created_at"] = datetime.utcnow()
+    doc["user_id"] = str(current_user["_id"])
     r = await leads_col.insert_one(doc)
     created = await leads_col.find_one({"_id": r.inserted_id})
     return serialize_doc(created)
 
 @app.post("/send-emails")
-async def send_emails(payload: SendEmailsPayload, background_tasks: BackgroundTasks):
+async def send_emails(payload: SendEmailsPayload, background_tasks: BackgroundTasks, current_user: dict = Depends(get_current_user)):
     try:
-        template_obj = await templates_col.find_one({"_id": oid(payload.template_id)})
+        template_obj = await templates_col.find_one({"_id": oid(payload.template_id), "user_id": str(current_user["_id"])})
     except HTTPException as e:
         raise e
     if not template_obj:
@@ -571,7 +693,7 @@ async def send_emails(payload: SendEmailsPayload, background_tasks: BackgroundTa
 
     lead_ids = payload.lead_ids or []
     if not lead_ids:
-        cursor = leads_col.find({"mail_sent": False}).sort("created_at", 1).limit(100)
+        cursor = leads_col.find({"user_id": str(current_user["_id"]), "mail_sent": False}).sort("created_at", 1).limit(100)
         lead_ids = []
         async for l in cursor:
             lead_ids.append(str(l["_id"]))
@@ -588,6 +710,7 @@ async def send_emails(payload: SendEmailsPayload, background_tasks: BackgroundTa
         background_send, 
         payload.template_id, 
         lead_ids, 
+        str(current_user["_id"]),
         attachments, 
         payload.email_account_ids
     )
@@ -597,8 +720,11 @@ async def send_emails(payload: SendEmailsPayload, background_tasks: BackgroundTa
 # Email Accounts Endpoints
 # --------------------
 @app.get("/email-accounts", response_model=List[EmailAccountOut])
-async def get_email_accounts(active_only: bool = True):
-    query = {"is_active": True} if active_only else {}
+async def get_email_accounts(active_only: bool = True, current_user: dict = Depends(get_current_user)):
+    query = {"user_id": str(current_user["_id"])}
+    if active_only:
+        query["is_active"] = True
+        
     cursor = email_accounts_col.find(query).sort("created_at", -1)
     accounts = []
     async for acc in cursor:
@@ -606,9 +732,9 @@ async def get_email_accounts(active_only: bool = True):
     return accounts
 
 @app.post("/email-accounts", response_model=EmailAccountOut, status_code=status.HTTP_201_CREATED)
-async def create_email_account(payload: EmailAccountIn):
-    # Check if email already exists
-    existing = await email_accounts_col.find_one({"email": payload.email})
+async def create_email_account(payload: EmailAccountIn, current_user: dict = Depends(get_current_user)):
+    # Check if email already exists for this user
+    existing = await email_accounts_col.find_one({"email": payload.email, "user_id": str(current_user["_id"])})
     if existing:
         raise HTTPException(status_code=400, detail="Email account already exists")
     
@@ -618,31 +744,32 @@ async def create_email_account(payload: EmailAccountIn):
     doc["emails_sent_today"] = 0
     doc["smtp_host"] = SMTP_HOST
     doc["smtp_port"] = SMTP_PORT
+    doc["user_id"] = str(current_user["_id"])
     
     r = await email_accounts_col.insert_one(doc)
     created = await email_accounts_col.find_one({"_id": r.inserted_id})
     return serialize_doc(created)
 
 @app.put("/email-accounts/{account_id}", response_model=EmailAccountOut)
-async def update_email_account(account_id: str, payload: EmailAccountIn):
+async def update_email_account(account_id: str, payload: EmailAccountIn, current_user: dict = Depends(get_current_user)):
     update_doc = {"$set": payload.dict()}
-    res = await email_accounts_col.update_one({"_id": oid(account_id)}, update_doc)
+    res = await email_accounts_col.update_one({"_id": oid(account_id), "user_id": str(current_user["_id"])}, update_doc)
     if res.matched_count == 0:
         raise HTTPException(status_code=404, detail="Email account not found")
     updated = await email_accounts_col.find_one({"_id": oid(account_id)})
     return serialize_doc(updated)
 
 @app.delete("/email-accounts/{account_id}")
-async def delete_email_account(account_id: str):
-    res = await email_accounts_col.delete_one({"_id": oid(account_id)})
+async def delete_email_account(account_id: str, current_user: dict = Depends(get_current_user)):
+    res = await email_accounts_col.delete_one({"_id": oid(account_id), "user_id": str(current_user["_id"])})
     if res.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Email account not found")
     return {"status": "deleted"}
 
 @app.post("/email-accounts/{account_id}/reset")
-async def reset_email_account_usage(account_id: str):
+async def reset_email_account_usage(account_id: str, current_user: dict = Depends(get_current_user)):
     res = await email_accounts_col.update_one(
-        {"_id": oid(account_id)},
+        {"_id": oid(account_id), "user_id": str(current_user["_id"])},
         {"$set": {"emails_sent_today": 0, "last_reset_date": datetime.utcnow()}}
     )
     if res.matched_count == 0:
@@ -653,14 +780,15 @@ async def reset_email_account_usage(account_id: str):
 # Analytics Endpoints
 # --------------------
 @app.get("/analytics/daily-stats")
-async def get_daily_stats(days: int = 30):
-    """Get daily statistics for leads and emails"""
+async def get_daily_stats(days: int = 30, current_user: dict = Depends(get_current_user)):
+    """Get daily statistics for leads and emails for the current user"""
     end_date = datetime.utcnow()
     start_date = end_date - timedelta(days=days)
+    user_id = str(current_user["_id"])
     
     # Get daily lead counts
     lead_pipeline = [
-        {"$match": {"created_at": {"$gte": start_date, "$lte": end_date}}},
+        {"$match": {"user_id": user_id, "created_at": {"$gte": start_date, "$lte": end_date}}},
         {"$group": {
             "_id": {"$dateToString": {"format": "%Y-%m-%d", "date": "$created_at"}},
             "leads_count": {"$sum": 1}
@@ -670,7 +798,7 @@ async def get_daily_stats(days: int = 30):
     
     # Get daily email counts from mail_logs
     email_pipeline = [
-        {"$match": {"created_at": {"$gte": start_date, "$lte": end_date}}},
+        {"$match": {"user_id": user_id, "created_at": {"$gte": start_date, "$lte": end_date}}},
         {"$group": {
             "_id": {"$dateToString": {"format": "%Y-%m-%d", "date": "$created_at"}},
             "emails_sent": {"$sum": "$sent_count"},
@@ -706,14 +834,16 @@ async def get_daily_stats(days: int = 30):
     return result
 
 @app.get("/analytics/summary")
-async def get_analytics_summary():
-    """Get overall analytics summary"""
-    total_leads = await leads_col.count_documents({})
-    unsent_leads = await leads_col.count_documents({"mail_sent": False})
+async def get_analytics_summary(current_user: dict = Depends(get_current_user)):
+    """Get overall analytics summary for the current user"""
+    user_id = str(current_user["_id"])
+    total_leads = await leads_col.count_documents({"user_id": user_id})
+    unsent_leads = await leads_col.count_documents({"user_id": user_id, "mail_sent": False})
     sent_leads = total_leads - unsent_leads
     
     # Get email stats from mail_logs
     email_stats = await mail_logs_col.aggregate([
+        {"$match": {"user_id": user_id}},
         {"$group": {
             "_id": None,
             "total_sent": {"$sum": "$sent_count"},
@@ -737,13 +867,14 @@ async def get_analytics_summary():
 # Bing Maps Scraping Endpoints
 # --------------------
 @app.post("/scrape-bing-maps", response_model=ScrapeResponse)
-async def scrape_bing_maps_endpoint(request: ScrapeRequest, background_tasks: BackgroundTasks):
+async def scrape_bing_maps_endpoint(request: ScrapeRequest, background_tasks: BackgroundTasks, current_user: dict = Depends(get_current_user)):
     try:
         # Start the scraping in the background
         background_tasks.add_task(
             save_scraped_data_to_db,
             request.query,
-            request.max_businesses
+            request.max_businesses,
+            str(current_user["_id"])
         )
         
         return {
@@ -754,7 +885,7 @@ async def scrape_bing_maps_endpoint(request: ScrapeRequest, background_tasks: Ba
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-async def save_scraped_data_to_db(query: str, max_businesses: int):
+async def save_scraped_data_to_db(query: str, max_businesses: int, user_id: str):
     """Background task that performs scraping and saves to DB"""
     try:
         # Import here to avoid circular imports
@@ -772,6 +903,7 @@ async def save_scraped_data_to_db(query: str, max_businesses: int):
                 "owner_name": "",  # Can't get this from Bing Maps
                 "mail_sent": False,
                 "created_at": datetime.utcnow(),
+                "user_id": user_id,
                 "source": "bing_maps_scraper",
                 "website": business.website,
                 "additional_info": {
@@ -795,24 +927,41 @@ async def save_scraped_data_to_db(query: str, max_businesses: int):
 # --------------------
 @app.post("/_dev/seed")
 async def seed_dev():
-    default = await templates_col.find_one({"name": "default"})
+    # Create a default user if none exists
+    default_user = await users_collection.find_one({"email": "admin@example.com"})
+    if not default_user:
+        hashed_password = get_password_hash("password123")
+        user_doc = {
+            "email": "admin@example.com",
+            "password": hashed_password,
+            "created_at": datetime.utcnow()
+        }
+        user_result = await users_collection.insert_one(user_doc)
+        user_id = str(user_result.inserted_id)
+    else:
+        user_id = str(default_user["_id"])
+    
+    # Create default template
+    default = await templates_col.find_one({"name": "default", "user_id": user_id})
     if not default:
         tdoc = {
             "name": "default",
             "subject": "Hello from EmailAgent",
             "content": "Hi {First Name},\n\nWe're reaching out from {Company} to share an opportunity.\n\nBest,\nYour Team",
-            "created_at": datetime.utcnow()
+            "created_at": datetime.utcnow(),
+            "user_id": user_id
         }
         await templates_col.insert_one(tdoc)
     
+    # Create sample leads
     sample_leads = [
-        {"company_name": "Acme Ltd", "contact_number": "03121234567", "email": "lead1@example.com", "owner_name": "Ali Khan", "mail_sent": False, "created_at": datetime.utcnow()},
-        {"company_name": "Beta Co", "contact_number": "03127654321", "email": "lead2@example.com", "owner_name": "Sara Ahmed", "mail_sent": False, "created_at": datetime.utcnow()},
+        {"company_name": "Acme Ltd", "contact_number": "03121234567", "email": "lead1@example.com", "owner_name": "Ali Khan", "mail_sent": False, "created_at": datetime.utcnow(), "user_id": user_id},
+        {"company_name": "Beta Co", "contact_number": "03127654321", "email": "lead2@example.com", "owner_name": "Sara Ahmed", "mail_sent": False, "created_at": datetime.utcnow(), "user_id": user_id},
     ]
     await leads_col.insert_many(sample_leads)
     
     # Add sample email accounts if none exist
-    email_count = await email_accounts_col.count_documents({})
+    email_count = await email_accounts_col.count_documents({"user_id": user_id})
     if email_count == 0:
         sample_accounts = [
             {
@@ -825,101 +974,14 @@ async def seed_dev():
                 "last_reset_date": datetime.utcnow(),
                 "emails_sent_today": 0,
                 "smtp_host": SMTP_HOST,
-                "smtp_port": SMTP_PORT
+                "smtp_port": SMTP_PORT,
+                "user_id": user_id
             }
         ]
         await email_accounts_col.insert_many(sample_accounts)
     
-    return {"status": "seeded"}
+    return {"status": "seeded", "user_id": user_id}
 
 @app.get("/")
 async def root():
     return {"status": "ok", "db": MONGODB_DB}
-
-from datetime import datetime, timedelta
-from collections import defaultdict
-
-# Add these endpoints after the existing API endpoints
-@app.get("/analytics/daily-stats")
-async def get_daily_stats(days: int = 30):
-    """Get daily statistics for leads created and emails sent"""
-    end_date = datetime.utcnow()
-    start_date = end_date - timedelta(days=days)
-    
-    # Get daily lead creation stats
-    pipeline_leads = [
-        {"$match": {"created_at": {"$gte": start_date, "$lte": end_date}}},
-        {"$group": {
-            "_id": {"$dateToString": {"format": "%Y-%m-%d", "date": "$created_at"}},
-            "leads_created": {"$sum": 1}
-        }},
-        {"$sort": {"_id": 1}}
-    ]
-    
-    # Get daily email sending stats
-    pipeline_emails = [
-        {"$match": {"created_at": {"$gte": start_date, "$lte": end_date}}},
-        {"$group": {
-            "_id": {"$dateToString": {"format": "%Y-%m-%d", "date": "$created_at"}},
-            "emails_sent": {"$sum": "$sent_count"},
-            "emails_failed": {"$sum": {"$size": "$failed"}}
-        }},
-        {"$sort": {"_id": 1}}
-    ]
-    
-    leads_cursor = leads_col.aggregate(pipeline_leads)
-    emails_cursor = db["mail_logs"].aggregate(pipeline_emails)
-    
-    leads_stats = await leads_cursor.to_list(length=None)
-    emails_stats = await emails_cursor.to_list(length=None)
-    
-    # Convert to dictionaries for easier merging
-    leads_dict = {stat["_id"]: stat["leads_created"] for stat in leads_stats}
-    emails_dict = {stat["_id"]: stat["emails_sent"] for stat in emails_stats}
-    
-    # Generate all dates in the range
-    all_dates = []
-    current_date = start_date
-    while current_date <= end_date:
-        date_str = current_date.strftime("%Y-%m-%d")
-        all_dates.append(date_str)
-        current_date += timedelta(days=1)
-    
-    # Build complete dataset
-    result = []
-    for date_str in all_dates:
-        result.append({
-            "date": date_str,
-            "leads_created": leads_dict.get(date_str, 0),
-            "emails_sent": emails_dict.get(date_str, 0)
-        })
-    
-    return result
-
-@app.get("/analytics/summary")
-async def get_analytics_summary():
-    """Get overall analytics summary"""
-    total_leads = await leads_col.count_documents({})
-    total_sent_leads = await leads_col.count_documents({"mail_sent": True})
-    total_unsent_leads = await leads_col.count_documents({"mail_sent": False})
-    
-    # Get total emails sent from mail_logs
-    pipeline = [
-        {"$group": {
-            "_id": None,
-            "total_emails_sent": {"$sum": "$sent_count"},
-            "total_emails_failed": {"$sum": {"$size": "$failed"}}
-        }}
-    ]
-    
-    email_stats = await db["mail_logs"].aggregate(pipeline).to_list(length=1)
-    email_stats = email_stats[0] if email_stats else {"total_emails_sent": 0, "total_emails_failed": 0}
-    
-    return {
-        "total_leads": total_leads,
-        "sent_leads": total_sent_leads,
-        "unsent_leads": total_unsent_leads,
-        "total_emails_sent": email_stats["total_emails_sent"],
-        "total_emails_failed": email_stats["total_emails_failed"],
-        "success_rate": (email_stats["total_emails_sent"] / (email_stats["total_emails_sent"] + email_stats["total_emails_failed"])) * 100 if (email_stats["total_emails_sent"] + email_stats["total_emails_failed"]) > 0 else 100
-    }
