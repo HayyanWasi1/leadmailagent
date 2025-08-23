@@ -32,27 +32,67 @@ const AnalyticsDashboard = () => {
   const [summary, setSummary] = useState(null);
   const [loading, setLoading] = useState(true);
   const [daysRange, setDaysRange] = useState(30);
+  const [error, setError] = useState(null);
 
   useEffect(() => {
     fetchAnalyticsData();
   }, [daysRange]);
 
+  const getAuthToken = () => {
+    if (typeof window !== 'undefined') {
+      return localStorage.getItem('token');
+    }
+    return null;
+  };
+
   const fetchAnalyticsData = async () => {
     try {
       setLoading(true);
+      setError(null);
+      
+      const token = getAuthToken();
+      if (!token) {
+        throw new Error('No authentication token found');
+      }
+
+      const headers = {
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      };
       
       // Fetch daily stats
-      const statsResponse = await fetch(`http://localhost:8000/analytics/daily-stats?days=${daysRange}`);
+      const statsResponse = await fetch(`http://localhost:8000/analytics/daily-stats?days=${daysRange}`, {
+        headers: headers
+      });
+      
+      if (!statsResponse.ok) {
+        if (statsResponse.status === 401) {
+          throw new Error('Authentication failed. Please log in again.');
+        }
+        throw new Error(`Failed to fetch daily stats: ${statsResponse.statusText}`);
+      }
+      
       const statsData = await statsResponse.json();
       setDailyStats(statsData);
       
       // Fetch summary
-      const summaryResponse = await fetch('http://localhost:8000/analytics/summary');
+      const summaryResponse = await fetch('http://localhost:8000/analytics/summary', {
+        headers: headers
+      });
+      
+      if (!summaryResponse.ok) {
+        if (summaryResponse.status === 401) {
+          throw new Error('Authentication failed. Please log in again.');
+        }
+        throw new Error(`Failed to fetch summary: ${summaryResponse.statusText}`);
+      }
+      
       const summaryData = await summaryResponse.json();
       setSummary(summaryData);
       
     } catch (error) {
       console.error('Error fetching analytics:', error);
+      setError(error.message);
     } finally {
       setLoading(false);
     }
@@ -117,6 +157,22 @@ const AnalyticsDashboard = () => {
     );
   }
 
+  if (error) {
+    return (
+      <div className="flex justify-center items-center h-64">
+        <div className="text-lg text-red-600">
+          Error: {error}
+          <button 
+            onClick={fetchAnalyticsData}
+            className="ml-4 px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600"
+          >
+            Retry
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="p-6 bg-gray-50 min-h-screen">
       <div className="max-w-7xl mx-auto">
@@ -143,7 +199,7 @@ const AnalyticsDashboard = () => {
             <div className="bg-white rounded-lg shadow p-6">
               <h3 className="text-lg font-semibold text-gray-700 mb-2">Success Rate</h3>
               <p className="text-3xl font-bold text-purple-600">
-                {summary.success_rate.toFixed(1)}%
+                {summary.success_rate?.toFixed(1) || '0'}%
               </p>
             </div>
           </div>

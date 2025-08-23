@@ -29,28 +29,81 @@ export default function SendEmails() {
     daily_limit: 100
   });
 
+  // Function to get auth token from localStorage
+  const getAuthToken = () => {
+    if (typeof window !== 'undefined') {
+      return localStorage.getItem('token');
+    }
+    return null;
+  };
+
+  // Function to get headers with authentication
+  const getAuthHeaders = () => {
+    const token = getAuthToken();
+    return {
+      'Authorization': `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    };
+  };
+
   useEffect(() => {
     const fetchData = async () => {
       try {
-        const templatesRes = await fetch('http://127.0.0.1:8000/templates');
+        const token = getAuthToken();
+        if (!token) {
+          throw new Error('No authentication token found');
+        }
+
+        const headers = {
+          'Authorization': `Bearer ${token}`,
+        };
+
+        const [templatesRes, countRes, accountsRes] = await Promise.all([
+          fetch('http://127.0.0.1:8000/templates', { headers }),
+          fetch('http://127.0.0.1:8000/leads/count?sent=false', { headers }), // ✅ add sent=false
+          fetch('http://127.0.0.1:8000/email-accounts', { headers })
+        ]);
+
+
+
+        if (!templatesRes.ok) {
+          if (templatesRes.status === 401) {
+            throw new Error('Authentication failed. Please log in again.');
+          }
+          throw new Error(`Failed to load templates: ${templatesRes.statusText}`);
+        }
+
+        if (!countRes.ok) {
+          if (countRes.status === 401) {
+            throw new Error('Authentication failed. Please log in again.');
+          }
+          throw new Error(`Failed to load lead count: ${countRes.statusText}`);
+        }
+
+        if (!accountsRes.ok) {
+          if (accountsRes.status === 401) {
+            throw new Error('Authentication failed. Please log in again.');
+          }
+          throw new Error(`Failed to load email accounts: ${accountsRes.statusText}`);
+        }
+
         const templatesData = await templatesRes.json();
+        const countData = await countRes.json();
+        const accountsData = await accountsRes.json();
+
         setTemplates(templatesData);
         setSelectedTemplate(templatesData[0]);
         setEmailContent(templatesData[0]?.content || '');
         setDistribution([{ templateId: templatesData[0]?.id || '', count: 0 }]);
 
-        const countRes = await fetch('http://127.0.0.1:8000/leads/count');
-        const countData = await countRes.json();
         setTotalLeads(countData.count);
-
-        const accountsRes = await fetch('http://127.0.0.1:8000/email-accounts');
-        const accountsData = await accountsRes.json();
         setEmailAccounts(accountsData);
         setSelectedAccounts(accountsData.map(acc => acc.id));
 
         setIsLoading(false);
       } catch (error) {
-        toast.error('Failed to load data');
+        toast.error(error.message || 'Failed to load data');
+        setIsLoading(false);
       }
     };
 
@@ -86,13 +139,31 @@ export default function SendEmails() {
   };
 
   const handleSendEmails = async () => {
+    const token = getAuthToken();
+    if (!token) {
+      toast.error('Please log in to send emails');
+      return;
+    }
+
     setIsSending(true);
     setShowProgressModal(true);
     setProgress(0);
     setCurrentEmail(0);
 
     try {
-      const leadsRes = await fetch('http://127.0.0.1:8000/leads?limit=1000');
+      const headers = {
+        'Authorization': `Bearer ${token}`,
+      };
+
+      const leadsRes = await fetch('http://127.0.0.1:8000/leads?limit=1000', { headers });
+
+      if (!leadsRes.ok) {
+        if (leadsRes.status === 401) {
+          throw new Error('Authentication failed. Please log in again.');
+        }
+        throw new Error(`Failed to fetch leads: ${leadsRes.statusText}`);
+      }
+
       const unsentLeads = await leadsRes.json();
 
       const leadsToSend = [];
@@ -118,7 +189,10 @@ export default function SendEmails() {
       // Send all emails at once using the new bulk endpoint
       const response = await fetch('http://127.0.0.1:8000/send-emails', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`,
+        },
         body: JSON.stringify({
           template_id: distribution[0].templateId, // For now, use first template
           lead_ids: leadsToSend.map(item => item.lead_id),
@@ -127,39 +201,54 @@ export default function SendEmails() {
         }),
       });
 
+      if (!response.ok) {
+        if (response.status === 401) {
+          throw new Error('Authentication failed. Please log in again.');
+        }
+        const errorData = await response.json().catch(() => ({}));
+        throw new Error(errorData.detail || `Failed to send emails: ${response.statusText}`);
+      }
+
       const result = await response.json();
 
       if (result.status === 'queued') {
-        // Poll for completion (simplified - in real app, use WebSockets or better polling)
+        // Poll for completion
         let attempts = 0;
         const maxAttempts = 60; // 5 minutes max
-        
+
         while (attempts < maxAttempts) {
           await new Promise(resolve => setTimeout(resolve, 5000)); // Check every 5 seconds
-          
-          const countRes = await fetch('http://127.0.0.1:8000/leads/count');
+
+          const countRes = await fetch('http://127.0.0.1:8000/leads/count', { headers });
+
+          if (!countRes.ok) {
+            if (countRes.status === 401) {
+              throw new Error('Authentication failed. Please log in again.');
+            }
+            throw new Error(`Failed to fetch lead count: ${countRes.statusText}`);
+          }
+
           const countData = await countRes.json();
-          
           const sentCount = totalLeads - countData.count;
           const currentProgress = Math.min(100, Math.round((sentCount / leadsToSend.length) * 100));
-          
+
           setCurrentEmail(sentCount);
           setProgress(currentProgress);
-          
+
           if (sentCount >= leadsToSend.length) {
             break;
           }
-          
+
           attempts++;
         }
-        
+
         setTotalLeads(totalLeads - leadsToSend.length);
         toast.success(`Successfully sent ${leadsToSend.length} emails`);
       } else {
         throw new Error(result.message || 'Failed to send emails');
       }
     } catch (error) {
-      toast.error(`Failed to send emails: ${error.message}`);
+      toast.error(error.message || 'Failed to send emails');
     } finally {
       setIsSending(false);
       setTimeout(() => {
@@ -171,31 +260,46 @@ export default function SendEmails() {
   const handleRephrase = async () => {
     if (!selectedTemplate) return;
 
+    const token = getAuthToken();
+    if (!token) {
+      toast.error('Please log in to rephrase emails');
+      return;
+    }
+
+    console.log('Selected template:', selectedTemplate); // Debug log
+    console.log('Auth token:', token); // Debug log
+
     const toastId = toast.loading('Rephrasing email...');
     try {
       const response = await fetch('http://127.0.0.1:8000/rephrase-email', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`,
+        },
         body: JSON.stringify({
           template_id: selectedTemplate.id,
           content: emailContent
         }),
       });
 
-      const result = await response.json();
+      console.log('Response status:', response.status); // Debug log
 
-      if (result.success) {
-        setEmailContent(result.rephrased_content);
-        setSelectedTemplate(result.template);
-        setTemplates(templates.map(t =>
-          t.id === result.template.id ? result.template : t
-        ));
-        toast.success('Email rephrased and saved!', { id: toastId });
-      } else {
-        throw new Error('Rephrasing failed');
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        console.error('Error details:', errorData); // Debug log
+
+        if (response.status === 401) {
+          throw new Error('Authentication failed. Please log in again.');
+        }
+        throw new Error(errorData.detail || `Rephrasing failed: ${response.status}`);
       }
+
+      const result = await response.json();
+      // ... rest of the function
     } catch (error) {
-      toast.error('Failed to rephrase email', { id: toastId });
+      console.error('Rephrase error:', error);
+      toast.error(error.message || 'Failed to rephrase email', { id: toastId });
     }
   };
 
@@ -221,12 +325,19 @@ export default function SendEmails() {
   };
 
   const handleGenerateNewTemplate = async () => {
+    const token = getAuthToken();
+    if (!token) {
+      toast.error('Please log in to create templates');
+      return;
+    }
+
     const toastId = toast.loading('Creating template...');
     try {
       const response = await fetch('http://127.0.0.1:8000/templates', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`,
         },
         body: JSON.stringify({
           name: `Custom ${templates.length + 1}`,
@@ -234,6 +345,13 @@ export default function SendEmails() {
           content: `Hi {First Name},\n\n${newTemplatePrompt}\n\nBest,\nYour Team`
         }),
       });
+
+      if (!response.ok) {
+        if (response.status === 401) {
+          throw new Error('Authentication failed. Please log in again.');
+        }
+        throw new Error('Failed to create template');
+      }
 
       const savedTemplate = await response.json();
       setTemplates([...templates, savedTemplate]);
@@ -243,20 +361,34 @@ export default function SendEmails() {
       setNewTemplatePrompt('');
       toast.success('Template created!', { id: toastId });
     } catch (error) {
-      toast.error('Failed to create template', { id: toastId });
+      toast.error(error.message || 'Failed to create template', { id: toastId });
     }
   };
 
   const handleAddEmailAccount = async () => {
+    const token = getAuthToken();
+    if (!token) {
+      toast.error('Please log in to add email accounts');
+      return;
+    }
+
     const toastId = toast.loading('Adding email account...');
     try {
       const response = await fetch('http://127.0.0.1:8000/email-accounts', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`,
         },
         body: JSON.stringify(newEmailAccount),
       });
+
+      if (!response.ok) {
+        if (response.status === 401) {
+          throw new Error('Authentication failed. Please log in again.');
+        }
+        throw new Error('Failed to add email account');
+      }
 
       const savedAccount = await response.json();
       setEmailAccounts([...emailAccounts, savedAccount]);
@@ -269,7 +401,7 @@ export default function SendEmails() {
       });
       toast.success('Email account added!', { id: toastId });
     } catch (error) {
-      toast.error('Failed to add email account', { id: toastId });
+      toast.error(error.message || 'Failed to add email account', { id: toastId });
     }
   };
 
@@ -282,20 +414,48 @@ export default function SendEmails() {
   };
 
   const handleResetAccount = async (accountId) => {
+    const token = getAuthToken();
+    if (!token) {
+      toast.error('Please log in to reset accounts');
+      return;
+    }
+
     const toastId = toast.loading('Resetting account...');
     try {
-      await fetch(`http://127.0.0.1:8000/email-accounts/${accountId}/reset`, {
+      const response = await fetch(`http://127.0.0.1:8000/email-accounts/${accountId}/reset`, {
         method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+        },
       });
-      
+
+      if (!response.ok) {
+        if (response.status === 401) {
+          throw new Error('Authentication failed. Please log in again.');
+        }
+        throw new Error('Failed to reset account');
+      }
+
       // Refresh accounts
-      const accountsRes = await fetch('http://127.0.0.1:8000/email-accounts');
+      const accountsRes = await fetch('http://127.0.0.1:8000/email-accounts', {
+        headers: {
+          'Authorization': `Bearer ${token}`,
+        },
+      });
+
+      if (!accountsRes.ok) {
+        if (accountsRes.status === 401) {
+          throw new Error('Authentication failed. Please log in again.');
+        }
+        throw new Error('Failed to refresh accounts');
+      }
+
       const accountsData = await accountsRes.json();
       setEmailAccounts(accountsData);
-      
+
       toast.success('Account reset successfully!', { id: toastId });
     } catch (error) {
-      toast.error('Failed to reset account', { id: toastId });
+      toast.error(error.message || 'Failed to reset account', { id: toastId });
     }
   };
 
@@ -340,11 +500,10 @@ export default function SendEmails() {
                 {emailAccounts.filter(acc => acc.is_active).slice(0, 3).map(account => (
                   <div key={account.id} className="flex items-center justify-between text-sm">
                     <span className="truncate">{account.email}</span>
-                    <span className={`px-2 py-1 rounded text-xs ${
-                      account.emails_sent_today >= account.daily_limit 
-                        ? 'bg-red-100 text-red-800' 
-                        : 'bg-green-100 text-green-800'
-                    }`}>
+                    <span className={`px-2 py-1 rounded text-xs ${account.emails_sent_today >= account.daily_limit
+                      ? 'bg-red-100 text-red-800'
+                      : 'bg-green-100 text-green-800'
+                      }`}>
                       {account.emails_sent_today}/{account.daily_limit}
                     </span>
                   </div>
@@ -591,28 +750,28 @@ export default function SendEmails() {
                   type="email"
                   placeholder="Email address"
                   value={newEmailAccount.email}
-                  onChange={(e) => setNewEmailAccount({...newEmailAccount, email: e.target.value})}
+                  onChange={(e) => setNewEmailAccount({ ...newEmailAccount, email: e.target.value })}
                   className="rounded-md border-gray-300 shadow-sm p-2 text-sm"
                 />
                 <input
                   type="password"
                   placeholder="App password"
                   value={newEmailAccount.password}
-                  onChange={(e) => setNewEmailAccount({...newEmailAccount, password: e.target.value})}
+                  onChange={(e) => setNewEmailAccount({ ...newEmailAccount, password: e.target.value })}
                   className="rounded-md border-gray-300 shadow-sm p-2 text-sm"
                 />
                 <input
                   type="text"
                   placeholder="Sender name (optional)"
                   value={newEmailAccount.sender_name}
-                  onChange={(e) => setNewEmailAccount({...newEmailAccount, sender_name: e.target.value})}
+                  onChange={(e) => setNewEmailAccount({ ...newEmailAccount, sender_name: e.target.value })}
                   className="rounded-md border-gray-300 shadow-sm p-2 text-sm"
                 />
                 <input
                   type="number"
                   placeholder="Daily limit"
                   value={newEmailAccount.daily_limit}
-                  onChange={(e) => setNewEmailAccount({...newEmailAccount, daily_limit: parseInt(e.target.value) || 100})}
+                  onChange={(e) => setNewEmailAccount({ ...newEmailAccount, daily_limit: parseInt(e.target.value) || 100 })}
                   className="rounded-md border-gray-300 shadow-sm p-2 text-sm"
                 />
               </div>
@@ -645,11 +804,10 @@ export default function SendEmails() {
                     </div>
                   </div>
                   <div className="flex items-center space-x-2">
-                    <span className={`px-2 py-1 rounded text-xs ${
-                      account.emails_sent_today >= account.daily_limit 
-                        ? 'bg-red-100 text-red-800' 
-                        : 'bg-green-100 text-green-800'
-                    }`}>
+                    <span className={`px-2 py-1 rounded text-xs ${account.emails_sent_today >= account.daily_limit
+                      ? 'bg-red-100 text-red-800'
+                      : 'bg-green-100 text-green-800'
+                      }`}>
                       {account.emails_sent_today}/{account.daily_limit}
                     </span>
                     <button

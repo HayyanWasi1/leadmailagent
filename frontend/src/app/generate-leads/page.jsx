@@ -15,6 +15,23 @@ export default function BingMapsScraper() {
   const [recentLeads, setRecentLeads] = useState([]);
   const [isLoadingLeads, setIsLoadingLeads] = useState(true);
 
+  // Function to get auth token from localStorage
+  const getAuthToken = () => {
+    if (typeof window !== 'undefined') {
+      return localStorage.getItem('token');
+    }
+    return null;
+  };
+
+  // Function to get headers with authentication
+  const getAuthHeaders = () => {
+    const token = getAuthToken();
+    return {
+      'Authorization': `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    };
+  };
+
   useEffect(() => {
     fetchRecentLeads();
   }, []);
@@ -22,12 +39,29 @@ export default function BingMapsScraper() {
   const fetchRecentLeads = async () => {
     try {
       setIsLoadingLeads(true);
-      const response = await fetch('http://127.0.0.1:8000/leads?limit=10&sent=false');
+      const token = getAuthToken();
+      if (!token) {
+        throw new Error('No authentication token found');
+      }
+
+      const response = await fetch('http://127.0.0.1:8000/leads?limit=10&sent=false', {
+        headers: {
+          'Authorization': `Bearer ${token}`,
+        }
+      });
+      
+      if (!response.ok) {
+        if (response.status === 401) {
+          throw new Error('Authentication failed. Please log in again.');
+        }
+        throw new Error(`Failed to fetch leads: ${response.statusText}`);
+      }
+      
       const leads = await response.json();
       setRecentLeads(leads);
     } catch (error) {
       console.error('Failed to fetch leads:', error);
-      toast.error('Failed to load recent leads');
+      toast.error(error.message || 'Failed to load recent leads');
     } finally {
       setIsLoadingLeads(false);
     }
@@ -44,6 +78,12 @@ export default function BingMapsScraper() {
       return;
     }
 
+    const token = getAuthToken();
+    if (!token) {
+      toast.error('Please log in to start scraping');
+      return;
+    }
+
     setIsScraping(true);
     setScrapeProgress({
       scraped: 0,
@@ -54,28 +94,35 @@ export default function BingMapsScraper() {
     try {
       const response = await fetch('http://127.0.0.1:8000/scrape-bing-maps', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`,
+        },
         body: JSON.stringify({
           query: query.trim(),
           max_businesses: maxBusinesses
         })
       });
 
-      const result = await response.json();
-      if (response.ok) {
-        toast.success(result.message);
-        setScrapeProgress(prev => ({
-          ...prev,
-          status: 'in_progress'
-        }));
-
-        // Start polling for progress
-        startProgressPolling(maxBusinesses);
-      } else {
-        throw new Error(result.detail || 'Failed to start scraping');
+      if (!response.ok) {
+        if (response.status === 401) {
+          throw new Error('Authentication failed. Please log in again.');
+        }
+        const errorData = await response.json().catch(() => ({}));
+        throw new Error(errorData.detail || `Failed to start scraping: ${response.statusText}`);
       }
+
+      const result = await response.json();
+      toast.success(result.message);
+      setScrapeProgress(prev => ({
+        ...prev,
+        status: 'in_progress'
+      }));
+
+      // Start polling for progress
+      startProgressPolling(maxBusinesses);
     } catch (error) {
-      toast.error(`Failed to start scraping: ${error.message}`);
+      toast.error(error.message || 'Failed to start scraping');
       setIsScraping(false);
       setScrapeProgress({
         scraped: 0,
@@ -88,8 +135,29 @@ export default function BingMapsScraper() {
   const startProgressPolling = (total) => {
     const interval = setInterval(async () => {
       try {
+        const token = getAuthToken();
+        if (!token) {
+          clearInterval(interval);
+          toast.error('Authentication lost. Please log in again.');
+          return;
+        }
+
         // Get count of unsent leads (newly scraped ones)
-        const countRes = await fetch('http://127.0.0.1:8000/leads/count?sent=false');
+        const countRes = await fetch('http://127.0.0.1:8000/leads/count?sent=false', {
+          headers: {
+            'Authorization': `Bearer ${token}`,
+          }
+        });
+
+        if (!countRes.ok) {
+          if (countRes.status === 401) {
+            clearInterval(interval);
+            toast.error('Authentication failed. Please log in again.');
+            return;
+          }
+          throw new Error(`Failed to fetch lead count: ${countRes.statusText}`);
+        }
+
         const countData = await countRes.json();
         const newLeads = countData.count;
 
@@ -111,7 +179,6 @@ export default function BingMapsScraper() {
           return newProgress;
         });
 
-        // ✅ side effects outside setState
         if (shouldComplete) {
           setIsScraping(false);
           clearInterval(interval);
@@ -120,7 +187,10 @@ export default function BingMapsScraper() {
         }
       } catch (error) {
         console.error('Error polling progress:', error);
-        clearInterval(interval);
+        if (error.message.includes('Authentication')) {
+          clearInterval(interval);
+          toast.error(error.message);
+        }
       }
     }, 3000); // Poll every 3 seconds
   };
@@ -271,17 +341,84 @@ export default function BingMapsScraper() {
           )}
         </div>
 
-        {recentLeads.length > 0 && (
-            <div className="mt-4 flex justify-between items-center text-sm text-gray-500">
-              <span>Showing {recentLeads.length} most recent leads</span>
-              <a
-                href="/send-emails"
-                className="text-indigo-600 hover:text-indigo-700 font-medium"
-              >
-                Go to Email Dashboard →
-              </a>
+        {/* Recent Leads Section */}
+        <div className="bg-white rounded-xl border border-gray-200 shadow-sm p-6">
+          <h2 className="text-xl font-semibold text-gray-800 mb-6">Recent Leads</h2>
+          
+          {isLoadingLeads ? (
+            <div className="flex justify-center items-center py-8">
+              <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-indigo-600"></div>
+            </div>
+          ) : recentLeads.length > 0 ? (
+            <>
+              <div className="overflow-x-auto">
+                <table className="min-w-full divide-y divide-gray-200">
+                  <thead className="bg-gray-50">
+                    <tr>
+                      <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                        Company
+                      </th>
+                      <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                        Phone
+                      </th>
+                      <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                        Email
+                      </th>
+                      <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                        Status
+                      </th>
+                    </tr>
+                  </thead>
+                  <tbody className="bg-white divide-y divide-gray-200">
+                    {recentLeads.map((lead, index) => (
+                      <tr key={index} className="hover:bg-gray-50">
+                        <td className="px-6 py-4 whitespace-nowrap">
+                          <div className="text-sm font-medium text-gray-900">
+                            {truncateText(lead.company_name, 30)}
+                          </div>
+                        </td>
+                        <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                          {formatPhoneNumber(lead.contact_number)}
+                        </td>
+                        <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                          {truncateText(lead.email, 25)}
+                        </td>
+                        <td className="px-6 py-4 whitespace-nowrap">
+                          <span className={`px-2 py-1 text-xs font-medium rounded-full ${
+                            lead.mail_sent 
+                              ? 'bg-green-100 text-green-800' 
+                              : 'bg-yellow-100 text-yellow-800'
+                          }`}>
+                            {lead.mail_sent ? 'Sent' : 'Pending'}
+                          </span>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <div className="mt-4 flex justify-between items-center text-sm text-gray-500">
+                <span>Showing {recentLeads.length} most recent leads</span>
+                <a
+                  href="/send-emails"
+                  className="text-indigo-600 hover:text-indigo-700 font-medium"
+                >
+                  Go to Email Dashboard →
+                </a>
+              </div>
+            </>
+          ) : (
+            <div className="text-center py-8">
+              <svg className="mx-auto h-12 w-12 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" />
+              </svg>
+              <h3 className="mt-2 text-sm font-medium text-gray-900">No leads yet</h3>
+              <p className="mt-1 text-sm text-gray-500">
+                Start scraping to find businesses and generate leads.
+              </p>
             </div>
           )}
+        </div>
       </div>
     </div>
   );
