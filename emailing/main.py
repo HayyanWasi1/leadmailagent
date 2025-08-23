@@ -117,8 +117,10 @@ def is_valid_email(email: str) -> bool:
 
 def oid(id_str: str) -> ObjectId:
     try:
+        print(f"Converting to ObjectId: {id_str}")  # Debug
         return ObjectId(id_str)
-    except Exception:
+    except Exception as e:
+        print(f"Invalid ObjectId: {id_str}, error: {e}")  # Debug
         raise HTTPException(status_code=400, detail=f"Invalid id: {id_str}")
 
 def serialize_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
@@ -559,6 +561,9 @@ async def background_send(template_id: str, lead_ids: List[str], user_id: str, a
 # --------------------
 @app.post("/rephrase-email")
 async def rephrase_email(request: RephraseRequest, current_user: dict = Depends(get_current_user)):
+    print(f"Rephrase request received from user: {current_user['email']}")  # Debug
+    print(f"Requested template ID: {request.template_id}")  # Debug
+    
     if not rephrase_agent:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -568,6 +573,8 @@ async def rephrase_email(request: RephraseRequest, current_user: dict = Depends(
     try:
         # Verify template exists first and belongs to user
         template = await templates_col.find_one({"_id": oid(request.template_id), "user_id": current_user["_id"]})
+        print(f"Template lookup result: {template is not None}")  # Debug
+        
         if not template:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,

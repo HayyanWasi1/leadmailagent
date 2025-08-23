@@ -44,7 +44,7 @@ const LoginPage = () => {
         setSuccess('Login successful! Redirecting...');
         // Redirect after short delay
         setTimeout(() => {
-          window.location.href = '/dashboard';
+          window.location.href = '/analytics';
         }, 1500);
       } else {
         try {
@@ -183,36 +183,6 @@ const LoginPage = () => {
             </button>
           </div>
         </form>
-
-        <div className="mt-6">
-          <div className="relative">
-            <div className="absolute inset-0 flex items-center">
-              <div className="w-full border-t border-gray-300"></div>
-            </div>
-            <div className="relative flex justify-center text-sm">
-              <span className="px-2 bg-white text-gray-500">Demo Credentials</span>
-            </div>
-          </div>
-
-          <div className="mt-4 bg-gray-50 p-4 rounded-lg">
-            <p className="text-sm text-gray-600 text-center">
-              <strong>Email:</strong> admin@example.com<br />
-              <strong>Password:</strong> password123
-            </p>
-            <p className="text-xs text-gray-500 mt-2 text-center">
-              Make sure to run the seed endpoint first: POST /_dev/seed
-            </p>
-          </div>
-        </div>
-
-        <div className="text-center">
-          <button
-            onClick={testConnection}
-            className="text-xs text-gray-500 hover:text-gray-700 underline"
-          >
-            Test backend connection
-          </button>
-        </div>
       </div>
     </div>
   );
