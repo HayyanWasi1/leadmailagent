@@ -26,7 +26,7 @@ export default function SendEmails() {
     email: '',
     password: '',
     sender_name: '',
-    daily_limit: 100
+    daily_limit: 0 // Changed from 100 to 0
   });
 
   // Function to get auth token from localStorage
@@ -63,8 +63,6 @@ export default function SendEmails() {
           fetch('http://127.0.0.1:8000/leads/count?sent=false', { headers }), // ✅ add sent=false
           fetch('http://127.0.0.1:8000/email-accounts', { headers })
         ]);
-
-
 
         if (!templatesRes.ok) {
           if (templatesRes.status === 401) {
@@ -138,6 +136,7 @@ export default function SendEmails() {
     });
   };
 
+  // Update the handleSendEmails function
   const handleSendEmails = async () => {
     const token = getAuthToken();
     if (!token) {
@@ -155,7 +154,8 @@ export default function SendEmails() {
         'Authorization': `Bearer ${token}`,
       };
 
-      const leadsRes = await fetch('http://127.0.0.1:8000/leads?limit=1000', { headers });
+      // Get only unsent leads
+      const leadsRes = await fetch('http://127.0.0.1:8000/leads?sent=false&limit=1000', { headers });
 
       if (!leadsRes.ok) {
         if (leadsRes.status === 401) {
@@ -166,8 +166,15 @@ export default function SendEmails() {
 
       const unsentLeads = await leadsRes.json();
 
+      // Filter out leads without email addresses
+      const leadsWithEmail = unsentLeads.filter(lead => lead.email && lead.email.trim() !== '');
+
+      if (leadsWithEmail.length === 0) {
+        throw new Error('No leads with valid email addresses available to send');
+      }
+
       const leadsToSend = [];
-      let remainingLeads = [...unsentLeads];
+      let remainingLeads = [...leadsWithEmail];
 
       for (const dist of distribution) {
         if (dist.count <= 0) continue;
@@ -181,7 +188,7 @@ export default function SendEmails() {
       }
 
       if (leadsToSend.length === 0) {
-        throw new Error('No unsent leads available to send');
+        throw new Error('No valid leads selected for sending');
       }
 
       setTotalEmails(leadsToSend.length);
@@ -194,7 +201,7 @@ export default function SendEmails() {
           'Authorization': `Bearer ${token}`,
         },
         body: JSON.stringify({
-          template_id: distribution[0].templateId, // For now, use first template
+          template_id: distribution[0].templateId,
           lead_ids: leadsToSend.map(item => item.lead_id),
           attachments: attachments.length > 0 ? attachments : undefined,
           email_account_ids: selectedAccounts
@@ -215,11 +222,12 @@ export default function SendEmails() {
         // Poll for completion
         let attempts = 0;
         const maxAttempts = 60; // 5 minutes max
+        let isComplete = false;
 
-        while (attempts < maxAttempts) {
+        while (attempts < maxAttempts && !isComplete) {
           await new Promise(resolve => setTimeout(resolve, 5000)); // Check every 5 seconds
 
-          const countRes = await fetch('http://127.0.0.1:8000/leads/count', { headers });
+          const countRes = await fetch('http://127.0.0.1:8000/leads/count?sent=false', { headers });
 
           if (!countRes.ok) {
             if (countRes.status === 401) {
@@ -229,20 +237,28 @@ export default function SendEmails() {
           }
 
           const countData = await countRes.json();
-          const sentCount = totalLeads - countData.count;
+          const remainingLeadsCount = countData.count;
+          const sentCount = totalLeads - remainingLeadsCount;
           const currentProgress = Math.min(100, Math.round((sentCount / leadsToSend.length) * 100));
 
           setCurrentEmail(sentCount);
           setProgress(currentProgress);
 
-          if (sentCount >= leadsToSend.length) {
+          if (sentCount >= leadsToSend.length || currentProgress === 100) {
+            isComplete = true;
             break;
           }
 
           attempts++;
         }
 
-        setTotalLeads(totalLeads - leadsToSend.length);
+        // Update total leads count
+        const finalCountRes = await fetch('http://127.0.0.1:8000/leads/count?sent=false', { headers });
+        if (finalCountRes.ok) {
+          const finalCountData = await finalCountRes.json();
+          setTotalLeads(finalCountData.count);
+        }
+
         toast.success(`Successfully sent ${leadsToSend.length} emails`);
       } else {
         throw new Error(result.message || 'Failed to send emails');
@@ -251,11 +267,23 @@ export default function SendEmails() {
       toast.error(error.message || 'Failed to send emails');
     } finally {
       setIsSending(false);
+      // Close modal after a short delay to show completion
       setTimeout(() => {
         setShowProgressModal(false);
+        setProgress(0);
+        setCurrentEmail(0);
       }, 2000);
     }
   };
+
+  // Add a cleanup function to handle modal closing
+  useEffect(() => {
+    if (!showProgressModal && progress === 100) {
+      // Reset progress when modal is closed
+      setProgress(0);
+      setCurrentEmail(0);
+    }
+  }, [showProgressModal, progress]);
 
   const handleRephrase = async () => {
     if (!selectedTemplate) return;
@@ -397,7 +425,7 @@ export default function SendEmails() {
         email: '',
         password: '',
         sender_name: '',
-        daily_limit: 100
+        daily_limit: 0 // Changed from 100 to 0
       });
       toast.success('Email account added!', { id: toastId });
     } catch (error) {
@@ -500,11 +528,8 @@ export default function SendEmails() {
                 {emailAccounts.filter(acc => acc.is_active).slice(0, 3).map(account => (
                   <div key={account.id} className="flex items-center justify-between text-sm">
                     <span className="truncate">{account.email}</span>
-                    <span className={`px-2 py-1 rounded text-xs ${account.emails_sent_today >= account.daily_limit
-                      ? 'bg-red-100 text-red-800'
-                      : 'bg-green-100 text-green-800'
-                      }`}>
-                      {account.emails_sent_today}/{account.daily_limit}
+                    <span className="px-2 py-1 rounded text-xs bg-green-100 text-green-800">
+                      {account.emails_sent_today} sent
                     </span>
                   </div>
                 ))}
@@ -619,13 +644,6 @@ export default function SendEmails() {
                 <div className="flex justify-between items-center">
                   <h2 className="text-xl font-bold text-gray-800">Editor</h2>
                   <div className="flex gap-2">
-                    <button
-                      onClick={handleRephrase}
-                      disabled={isSending}
-                      className="px-3 py-1.5 text-sm rounded-md text-gray-700 bg-gray-100 disabled:opacity-50"
-                    >
-                      Rephrase
-                    </button>
                     <button
                       onClick={handleSendEmails}
                       disabled={emailsToSend === 0 || isSending || selectedAccounts.length === 0}
@@ -767,13 +785,6 @@ export default function SendEmails() {
                   onChange={(e) => setNewEmailAccount({ ...newEmailAccount, sender_name: e.target.value })}
                   className="rounded-md border-gray-300 shadow-sm p-2 text-sm"
                 />
-                <input
-                  type="number"
-                  placeholder="Daily limit"
-                  value={newEmailAccount.daily_limit}
-                  onChange={(e) => setNewEmailAccount({ ...newEmailAccount, daily_limit: parseInt(e.target.value) || 100 })}
-                  className="rounded-md border-gray-300 shadow-sm p-2 text-sm"
-                />
               </div>
               <button
                 onClick={handleAddEmailAccount}
@@ -798,17 +809,13 @@ export default function SendEmails() {
                     <div>
                       <div className="font-medium">{account.email}</div>
                       <div className="text-sm text-gray-500">
-                        {account.sender_name && `From: ${account.sender_name} • `}
-                        Limit: {account.daily_limit}/day
+                        {account.sender_name && `From: ${account.sender_name}`}
                       </div>
                     </div>
                   </div>
                   <div className="flex items-center space-x-2">
-                    <span className={`px-2 py-1 rounded text-xs ${account.emails_sent_today >= account.daily_limit
-                      ? 'bg-red-100 text-red-800'
-                      : 'bg-green-100 text-green-800'
-                      }`}>
-                      {account.emails_sent_today}/{account.daily_limit}
+                    <span className="px-2 py-1 rounded text-xs bg-green-100 text-green-800">
+                      {account.emails_sent_today} sent
                     </span>
                     <button
                       onClick={() => handleResetAccount(account.id)}

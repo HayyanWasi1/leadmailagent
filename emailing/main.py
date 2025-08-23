@@ -113,6 +113,11 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
 EMAIL_REGEX = r'^[\w\.-]+@[\w\.-]+\.\w+$'
 
 def is_valid_email(email: str) -> bool:
+    if not email or not isinstance(email, str):
+        return False
+    email = email.strip()
+    if not email:
+        return False
     return re.match(EMAIL_REGEX, email) is not None
 
 def oid(id_str: str) -> ObjectId:
@@ -154,8 +159,16 @@ class TemplateOut(TemplateIn):
 class LeadIn(BaseModel):
     company_name: Optional[str] = None
     contact_number: Optional[str] = None
-    email: Optional[EmailStr] = None
+    email: Optional[EmailStr] = None  # This uses EmailStr which provides basic validation
     owner_name: Optional[str] = None
+
+    @validator('email', pre=True, always=True)
+    def validate_email(cls, v):
+        if v is None or v == '':
+            return None
+        if not is_valid_email(v):
+            return None  # Or raise validation error if you prefer
+        return v
 
 class LeadOut(LeadIn):
     id: str
@@ -171,7 +184,6 @@ class EmailAccountIn(BaseModel):
     email: EmailStr
     password: str = Field(..., description="App password for the email account")
     sender_name: Optional[str] = None
-    daily_limit: int = Field(100, ge=1, description="Maximum emails to send per day")
     is_active: bool = True
 
 class EmailAccountOut(EmailAccountIn):
@@ -244,28 +256,11 @@ rephrase_agent = setup_rephrase_agent()
 # Email Account Management
 # --------------------
 async def get_available_email_accounts(user_id: str) -> List[Dict[str, Any]]:
-    """Get all active email accounts that haven't reached their daily limit for a specific user"""
-    # First, check if we need to reset daily counts
-    today = datetime.utcnow().date()
-    
-    # Find accounts that need reset
-    accounts_to_reset = await email_accounts_col.find({
-        "user_id": user_id,
-        "last_reset_date": {"$lt": datetime(today.year, today.month, today.day)}
-    }).to_list(length=None)
-    
-    # Reset counts for these accounts
-    if accounts_to_reset:
-        await email_accounts_col.update_many(
-            {"_id": {"$in": [acc["_id"] for acc in accounts_to_reset]}},
-            {"$set": {"emails_sent_today": 0, "last_reset_date": datetime.utcnow()}}
-        )
-    
-    # Get all active accounts that haven't reached their daily limit
+    """Get all active email accounts for a specific user (no daily limit checks)"""
+    # Get all active accounts
     cursor = email_accounts_col.find({
         "user_id": user_id,
-        "is_active": True,
-        "emails_sent_today": {"$lt": "$daily_limit"}
+        "is_active": True
     })
     
     accounts = []
@@ -275,11 +270,9 @@ async def get_available_email_accounts(user_id: str) -> List[Dict[str, Any]]:
     return accounts
 
 async def update_email_account_usage(account_id: ObjectId, emails_sent: int):
-    """Update the count of emails sent for an account"""
-    await email_accounts_col.update_one(
-        {"_id": account_id},
-        {"$inc": {"emails_sent_today": emails_sent}}
-    )
+    """Update the count of emails sent for an account - now a no-op"""
+    # No longer tracking usage, so this function does nothing
+    pass
 
 # --------------------
 # Authentication Endpoints
@@ -379,10 +372,9 @@ def send_bulk_via_smtp_blocking(
     messages: List[Dict[str, Any]], 
     delay: float = 1.0
 ) -> Dict[str, Any]:
-    """Send emails using multiple accounts with round-robin distribution"""
+    """Send emails using multiple accounts with round-robin distribution (no daily limits)"""
     sent = []
     failed = []
-    account_usage = {acc["_id"]: 0 for acc in email_accounts}
     
     # Create SMTP connections for each account
     connections = {}
@@ -415,12 +407,6 @@ def send_bulk_via_smtp_blocking(
         if not account:
             continue
             
-        # Check if account has reached its daily limit
-        if account["emails_sent_today"] + account_usage[account["_id"]] >= account["daily_limit"]:
-            # Skip this account, try next one
-            current_account_index = (current_account_index + 1) % len(account_ids)
-            continue
-            
         try:
             msgstr = build_message(
                 account["email"], 
@@ -432,7 +418,6 @@ def send_bulk_via_smtp_blocking(
             )
             connections[account_id].sendmail(account["email"], m["to"], msgstr)
             sent.append({"email": m["to"], "account_id": str(account["_id"])})
-            account_usage[account["_id"]] += 1
             print(f"Sent email to {m['to']} using account {account['email']}")
         except Exception as e:
             error_msg = str(e)
@@ -464,7 +449,7 @@ def send_bulk_via_smtp_blocking(
         except:
             pass
     
-    return {"sent": sent, "failed": failed, "account_usage": account_usage}
+    return {"sent": sent, "failed": failed}
 
 async def mark_leads_sent(lead_ids: List[str], user_id: str):
     oids = []
@@ -485,28 +470,45 @@ async def background_send(template_id: str, lead_ids: List[str], user_id: str, a
     if not tmpl:
         return {"status": "template_not_found"}
 
-    q = {"_id": {"$in": [ObjectId(l) for l in lead_ids if ObjectId.is_valid(l)]}, "user_id": user_id}
+    # Convert lead IDs to ObjectIds
+    lead_object_ids = []
+    for lid in lead_ids:
+        try:
+            if ObjectId.is_valid(lid):
+                lead_object_ids.append(ObjectId(lid))
+        except Exception:
+            continue
+    
+    if not lead_object_ids:
+        return {"status": "no_valid_leads"}
+    
+    q = {"_id": {"$in": lead_object_ids}, "user_id": user_id}
     leads_cursor = leads_col.find(q)
     leads = []
     async for l in leads_cursor:
         leads.append(l)
 
     messages = []
+    valid_leads = []
     for l in leads:
         recipient = l.get("email")
+        # Skip leads without email or with invalid email
         if not recipient or not is_valid_email(recipient):
             continue
+        
         body = tmpl.get("content", "")
         first = l["owner_name"].split()[0] if l.get("owner_name") else ""
         body = body.replace("{First Name}", first)
         body = body.replace("{Company}", l.get("company_name", ""))
         subject = tmpl.get("subject", "")
+        
         messages.append({
             "to": recipient, 
             "subject": subject, 
             "body": body,
             "attachments": attachments
         })
+        valid_leads.append(l)
 
     if not messages:
         return {"status": "no_valid_recipients"}
@@ -534,16 +536,11 @@ async def background_send(template_id: str, lead_ids: List[str], user_id: str, a
         SMTP_DELAY
     )
 
-    # Update tracking of sent emails and account usage
+    # Update tracking of sent emails
     sent_emails = [s["email"] for s in result.get("sent", [])]
-    sent_lead_ids = [str(l["_id"]) for l in leads if l.get("email") in sent_emails]
+    sent_lead_ids = [str(l["_id"]) for l in valid_leads if l.get("email") in sent_emails]
     if sent_lead_ids:
         await mark_leads_sent(sent_lead_ids, user_id)
-    
-    # Update account usage counts
-    for account_id, count in result.get("account_usage", {}).items():
-        if count > 0:
-            await update_email_account_usage(ObjectId(account_id), count)
 
     await mail_logs_col.insert_one({
         "template_id": template_id,
@@ -552,7 +549,9 @@ async def background_send(template_id: str, lead_ids: List[str], user_id: str, a
         "failed": result.get("failed", []),
         "created_at": datetime.utcnow(),
         "had_attachments": bool(attachments),
-        "accounts_used": [str(acc["_id"]) for acc in email_accounts]
+        "accounts_used": [str(acc["_id"]) for acc in email_accounts],
+        "total_leads_processed": len(leads),
+        "valid_leads_count": len(valid_leads)
     })
     return result
 
@@ -747,8 +746,6 @@ async def create_email_account(payload: EmailAccountIn, current_user: dict = Dep
     
     doc = payload.dict()
     doc["created_at"] = datetime.utcnow()
-    doc["last_reset_date"] = datetime.utcnow()
-    doc["emails_sent_today"] = 0
     doc["smtp_host"] = SMTP_HOST
     doc["smtp_port"] = SMTP_PORT
     doc["user_id"] = str(current_user["_id"])
@@ -772,16 +769,6 @@ async def delete_email_account(account_id: str, current_user: dict = Depends(get
     if res.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Email account not found")
     return {"status": "deleted"}
-
-@app.post("/email-accounts/{account_id}/reset")
-async def reset_email_account_usage(account_id: str, current_user: dict = Depends(get_current_user)):
-    res = await email_accounts_col.update_one(
-        {"_id": oid(account_id), "user_id": str(current_user["_id"])},
-        {"$set": {"emails_sent_today": 0, "last_reset_date": datetime.utcnow()}}
-    )
-    if res.matched_count == 0:
-        raise HTTPException(status_code=404, detail="Email account not found")
-    return {"status": "reset"}
 
 # --------------------
 # Analytics Endpoints
@@ -975,11 +962,8 @@ async def seed_dev():
                 "email": "example1@gmail.com",
                 "password": "your_app_password_here",
                 "sender_name": "Sales Team",
-                "daily_limit": 100,
                 "is_active": True,
                 "created_at": datetime.utcnow(),
-                "last_reset_date": datetime.utcnow(),
-                "emails_sent_today": 0,
                 "smtp_host": SMTP_HOST,
                 "smtp_port": SMTP_PORT,
                 "user_id": user_id
