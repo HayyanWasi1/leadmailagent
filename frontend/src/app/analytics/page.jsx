@@ -25,6 +25,8 @@ ChartJS.register(
 );
 
 const AnalyticsDashboard = () => {
+  const BASE_URL = process.env.NEXT_PUBLIC_BASE_URL;
+
   const [dailyStats, setDailyStats] = useState([]);
   const [summary, setSummary] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -64,7 +66,7 @@ const AnalyticsDashboard = () => {
       };
 
       // Fetch daily stats from the API.
-      const statsResponse = await fetch(`http://localhost:8000/analytics/daily-stats?days=${daysRange}`, {
+      const statsResponse = await fetch(`${BASE_URL}/analytics/daily-stats?days=${daysRange}`, {
         headers: headers
       });
 
@@ -83,7 +85,7 @@ const AnalyticsDashboard = () => {
       setDailyStats(statsData);
 
       // Fetch summary data from the API.
-      const summaryResponse = await fetch('http://localhost:8000/analytics/summary', {
+      const summaryResponse = await fetch(`${BASE_URL}/analytics/summary`, {
         headers: headers
       });
 

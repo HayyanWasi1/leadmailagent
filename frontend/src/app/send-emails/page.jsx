@@ -4,6 +4,8 @@ import Head from 'next/head';
 import toast, { Toaster } from 'react-hot-toast';
 
 export default function SendEmails() {
+  const BASE_URL = process.env.NEXT_PUBLIC_BASE_URL;
+
   const [selectedTemplate, setSelectedTemplate] = useState(null);
   const [emailContent, setEmailContent] = useState('');
   const [isSending, setIsSending] = useState(false);
@@ -68,9 +70,9 @@ export default function SendEmails() {
         };
 
         const [templatesRes, countRes, accountsRes] = await Promise.all([
-          fetch('http://127.0.0.1:8000/templates', { headers }),
-          fetch('http://127.0.0.1:8000/leads/count?sent=false', { headers }), // ✅ add sent=false
-          fetch('http://127.0.0.1:8000/email-accounts', { headers })
+          fetch(`${BASE_URL}/templates`, { headers }),
+          fetch(`${BASE_URL}/leads/count?sent=false`, { headers }), // ✅ add sent=false
+          fetch(`${BASE_URL}/email-accounts`, { headers })
         ]);
 
         if (!templatesRes.ok) {
@@ -164,7 +166,7 @@ export default function SendEmails() {
       };
 
       // Get only unsent leads
-      const leadsRes = await fetch('http://127.0.0.1:8000/leads?sent=false&limit=1000', { headers });
+      const leadsRes = await fetch(`${BASE_URL}/leads?sent=false&limit=1000`, { headers });
 
       if (!leadsRes.ok) {
         if (leadsRes.status === 401) {
@@ -203,7 +205,7 @@ export default function SendEmails() {
       setTotalEmails(leadsToSend.length);
 
       // Send all emails at once using the new bulk endpoint
-      const response = await fetch('http://127.0.0.1:8000/send-emails', {
+      const response = await fetch(`${BASE_URL}/send-emails`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -236,7 +238,7 @@ export default function SendEmails() {
         while (attempts < maxAttempts && !isComplete) {
           await new Promise(resolve => setTimeout(resolve, 5000)); // Check every 5 seconds
 
-          const countRes = await fetch('http://127.0.0.1:8000/leads/count?sent=false', { headers });
+          const countRes = await fetch(`${BASE_URL}/leads/count?sent=false`, { headers });
 
           if (!countRes.ok) {
             if (countRes.status === 401) {
@@ -262,7 +264,7 @@ export default function SendEmails() {
         }
 
         // Update total leads count
-        const finalCountRes = await fetch('http://127.0.0.1:8000/leads/count?sent=false', { headers });
+        const finalCountRes = await fetch(`${BASE_URL}/leads/count?sent=false`, { headers });
         if (finalCountRes.ok) {
           const finalCountData = await finalCountRes.json();
           setTotalLeads(finalCountData.count);
@@ -308,7 +310,7 @@ export default function SendEmails() {
 
     const toastId = toast.loading('Rephrasing email...');
     try {
-      const response = await fetch('http://127.0.0.1:8000/rephrase-email', {
+      const response = await fetch(`${BASE_URL}/rephrase-email`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -370,7 +372,7 @@ export default function SendEmails() {
 
     const toastId = toast.loading('Creating template...');
     try {
-      const response = await fetch('http://127.0.0.1:8000/templates', {
+      const response = await fetch(`${BASE_URL}/templates`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -411,7 +413,7 @@ export default function SendEmails() {
 
     const toastId = toast.loading('Adding email account...');
     try {
-      const response = await fetch('http://127.0.0.1:8000/email-accounts', {
+      const response = await fetch(`${BASE_URL}/email-accounts`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -459,7 +461,7 @@ export default function SendEmails() {
 
     const toastId = toast.loading('Resetting account...');
     try {
-      const response = await fetch(`http://127.0.0.1:8000/email-accounts/${accountId}/reset`, {
+      const response = await fetch(`${BASE_URL}/email-accounts/${accountId}/reset`, {
         method: 'POST',
         headers: {
           'Authorization': `Bearer ${token}`,
@@ -474,7 +476,7 @@ export default function SendEmails() {
       }
 
       // Refresh accounts
-      const accountsRes = await fetch('http://127.0.0.1:8000/email-accounts', {
+      const accountsRes = await fetch(`${BASE_URL}/email-accounts`, {
         headers: {
           'Authorization': `Bearer ${token}`,
         },
@@ -517,7 +519,7 @@ export default function SendEmails() {
 
     const toastId = toast.loading('Adding lead...');
     try {
-      const response = await fetch('http://127.0.0.1:8000/leads/manual', {
+      const response = await fetch(`${BASE_URL}/leads/manual`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
