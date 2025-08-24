@@ -5,12 +5,8 @@ import threading
 
 EMAIL_ACCOUNTS = [
     {
-        'username': 'sample@gmail.com',
-        'password': 'txghrfzssgaordqh1234'
-    },
-    {
-        'username': 'sample2@gmail.com', 
-        'password': 'funrhujnhsuwmma'
+        'username': 'mwprac47@gmail.com',
+        'password': 'txghrfzssgaordqh'
     },
 ]
 

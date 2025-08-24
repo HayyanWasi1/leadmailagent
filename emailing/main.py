@@ -8,6 +8,9 @@ from typing import List, Optional, Any, Dict
 from datetime import timedelta
 from datetime import datetime
 from pydantic import BaseModel, Field, EmailStr, validator
+from imap_tools import MailBox
+import email.utils
+import threading
 from fastapi import FastAPI, HTTPException, BackgroundTasks, status, Depends
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
@@ -155,6 +158,13 @@ class TemplateOut(TemplateIn):
     id: str
     created_at: datetime
     user_id: str
+    
+class UnreadEmail(BaseModel):
+    sender_email: str
+    recipient_email: str
+    subject: str
+    time: str
+    preview: str
 
 class LeadIn(BaseModel):
     company_name: Optional[str] = None
@@ -251,6 +261,99 @@ def setup_rephrase_agent():
         return None
 
 rephrase_agent = setup_rephrase_agent()
+
+async def check_unread_emails(user_id: str, max_emails: int = 10) -> List[Dict[str, Any]]:
+    """Fetch recent emails (read or unread) for all email accounts of a user"""
+    print(f"🔍 Starting recent email check for user_id: {user_id}, max_emails: {max_emails}")
+    
+    # Get all email accounts for the user
+    email_accounts = await email_accounts_col.find({
+        "user_id": user_id,
+        "is_active": True
+    }).to_list(length=None)
+    
+    print(f"📧 Found {len(email_accounts)} active email accounts for user")
+    for i, acc in enumerate(email_accounts):
+        print(f"  Account {i+1}: {acc.get('email', 'No email')} (ID: {acc.get('_id', 'No ID')})")
+    
+    recent_emails = []
+    emails_lock = threading.Lock()
+    
+    def process_email_account(account):
+        nonlocal recent_emails
+        account_email = account.get("email", "Unknown")
+        print(f"🔎 Checking account: {account_email}")
+        
+        try:
+            print(f"🔄 Connecting to IMAP server for {account_email}")
+            with MailBox("imap.gmail.com").login(account["email"], account["password"], "INBOX") as mailbox:
+                print(f"✅ Successfully connected to {account_email}")
+                
+                # Fetch recent emails (read + unread)
+                emails_found = 0
+                for msg in mailbox.fetch(criteria="ALL", limit=max_emails, reverse=True):  
+                    emails_found += 1
+                    sender_name, sender_email = email.utils.parseaddr(msg.from_)
+                    email_time = msg.date.strftime("%d-%m-%Y %I:%M:%p") if msg.date else "Unknown"
+                    
+                    # Get first 100 chars as preview
+                    preview = msg.text or msg.html or ""
+                    if preview:
+                        preview = preview[:100] + "..." if len(preview) > 100 else preview
+                    
+                    with emails_lock:
+                        recent_emails.append({
+                            "sender_email": sender_email,
+                            "recipient_email": account["email"],
+                            "subject": msg.subject or "No Subject",
+                            "time": email_time,
+                            "preview": preview,
+                            "is_unread": "\\Seen" not in msg.flags  # mark unread flag
+                        })
+                    
+                    print(f"📩 Found email from {sender_email} to {account_email} at {email_time} | Flags: {msg.flags}")
+                
+                if emails_found == 0:
+                    print(f"ℹ️ No emails found for {account_email}")
+                else:
+                    print(f"✅ Found {emails_found} recent emails for {account_email}")
+                    
+        except Exception as e:
+            error_msg = str(e)
+            print(f"❌ Error checking emails for {account_email}: {error_msg}")
+            if "Authentication failed" in error_msg:
+                print(f"🔐 Authentication issue with {account_email}. Check password/app password.")
+            elif "connection failed" in error_msg.lower():
+                print(f"🌐 Connection issue with {account_email}. Check network/IMAP settings.")
+            elif "SSL" in error_msg:
+                print(f"🔒 SSL issue with {account_email}. Check port/SSL configuration.")
+    
+    # Create threads for each email account
+    threads = []
+    print(f"🧵 Creating threads for {len(email_accounts)} email accounts")
+    
+    for account in email_accounts:
+        thread = threading.Thread(target=process_email_account, args=(account,))
+        thread.start()
+        threads.append(thread)
+        print(f"➡️ Started thread for account: {account.get('email', 'Unknown')}")
+    
+    # Wait for all threads to complete
+    print("⏳ Waiting for all email accounts to be checked...")
+    for i, thread in enumerate(threads):
+        thread.join(timeout=30)
+        if thread.is_alive():
+            print(f"⏰ Thread {i+1} timed out after 30 seconds")
+        else:
+            print(f"✅ Thread {i+1} completed successfully")
+    
+    # Sort by time (newest first) and limit to max_emails
+    print(f"📊 Sorting {len(recent_emails)} found emails by time")
+    recent_emails.sort(key=lambda x: x.get("time", ""), reverse=True)
+    result = recent_emails[:max_emails]
+    
+    print(f"🎉 Recent email check completed. Returning {len(result)} emails")
+    return result
 
 # --------------------
 # Email Account Management
@@ -736,6 +839,22 @@ async def get_email_accounts(active_only: bool = True, current_user: dict = Depe
     async for acc in cursor:
         accounts.append(serialize_doc(acc))
     return accounts
+
+@app.get("/unread-emails", response_model=List[UnreadEmail])
+async def get_unread_emails(max_emails: int = 10, current_user: dict = Depends(get_current_user)):
+    """Get unread emails from all email accounts"""
+    print(f"📨 API request for unread emails from user: {current_user['email']}")
+    try:
+        unread_emails = await check_unread_emails(str(current_user["_id"]), max_emails)
+        print(f"✅ API request completed. Returning {len(unread_emails)} emails")
+        return unread_emails
+    except Exception as e:
+        print(f"❌ API error: {str(e)}")
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch unread emails"
+        )
 
 @app.post("/email-accounts", response_model=EmailAccountOut, status_code=status.HTTP_201_CREATED)
 async def create_email_account(payload: EmailAccountIn, current_user: dict = Depends(get_current_user)):
