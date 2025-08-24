@@ -35,7 +35,7 @@ load_dotenv()
 # --------------------
 # Config
 # --------------------
-MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
+MONGODB_URI = os.getenv("MONGODB_URI")
 MONGODB_DB = os.getenv("MONGODB_DB", "email_agent_db")
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", 465))
@@ -668,7 +668,7 @@ async def rephrase_email(request: RephraseRequest, current_user: dict = Depends(
     
     if not rephrase_agent:
         raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            status_code=status.HTTP_503_SERVICE_UNAVERAGE,
             detail="Rephrasing service not configured"
         )
     
@@ -999,7 +999,7 @@ async def scrape_bing_maps_endpoint(request: ScrapeRequest, background_tasks: Ba
         raise HTTPException(status_code=500, detail=str(e))
 
 async def save_scraped_data_to_db(query: str, max_businesses: int, user_id: str):
-    """Background task that performs scraping and saves to DB"""
+    """Background task that performs scraping and saves to DB in batches of 10"""
     try:
         # Import here to avoid circular imports
         from scraper import scrape_bing_maps
@@ -1008,7 +1008,9 @@ async def save_scraped_data_to_db(query: str, max_businesses: int, user_id: str)
         
         # Convert to lead format for your database
         leads_to_insert = []
-        for business in results:
+        batch_size = 10  # Save in batches of 10 to reduce API calls
+        
+        for i, business in enumerate(results):
             lead = {
                 "company_name": business.shop_name,
                 "contact_number": business.phone,
@@ -1026,10 +1028,14 @@ async def save_scraped_data_to_db(query: str, max_businesses: int, user_id: str)
                 }
             }
             leads_to_insert.append(lead)
+            
+            # Save in batches of 10
+            if len(leads_to_insert) >= batch_size or i == len(results) - 1:
+                await leads_col.insert_many(leads_to_insert)
+                print(f"✅ Saved batch of {len(leads_to_insert)} leads to database")
+                leads_to_insert = []  # Reset for next batch
         
-        if leads_to_insert:
-            await leads_col.insert_many(leads_to_insert)
-            print(f"✅ Saved {len(leads_to_insert)} leads to database")
+        print(f"🎉 Total {len(results)} leads processed and saved in batches")
         
     except Exception as e:
         print(f"❌ Error in background scraping task: {str(e)}")
@@ -1115,7 +1121,7 @@ async def scrape_google_maps_endpoint(request: ScrapeRequest, background_tasks: 
         raise HTTPException(status_code=500, detail=str(e))
 
 async def save_google_scraped_data_to_db(query: str, max_businesses: int, user_id: str):
-    """Background task that performs Google Maps scraping and saves to DB"""
+    """Background task that performs Google Maps scraping and saves to DB in batches of 10"""
     try:
         # Import the Google Maps scraping function
         from google_scraper import scrape_google_maps
@@ -1124,7 +1130,9 @@ async def save_google_scraped_data_to_db(query: str, max_businesses: int, user_i
         
         # Convert to lead format for your database
         leads_to_insert = []
-        for business in results:
+        batch_size = 10  # Save in batches of 10 to reduce API calls
+        
+        for i, business in enumerate(results):
             lead = {
                 "company_name": business.get("company_name", ""),
                 "contact_number": business.get("phone", ""),
@@ -1141,10 +1149,14 @@ async def save_google_scraped_data_to_db(query: str, max_businesses: int, user_i
                 }
             }
             leads_to_insert.append(lead)
+            
+            # Save in batches of 10
+            if len(leads_to_insert) >= batch_size or i == len(results) - 1:
+                await leads_col.insert_many(leads_to_insert)
+                print(f"✅ Saved batch of {len(leads_to_insert)} Google Maps leads to database")
+                leads_to_insert = []  # Reset for next batch
         
-        if leads_to_insert:
-            await leads_col.insert_many(leads_to_insert)
-            print(f"✅ Saved {len(leads_to_insert)} Google Maps leads to database")
+        print(f"🎉 Total {len(results)} Google Maps leads processed and saved in batches")
         
     except Exception as e:
         print(f"❌ Error in background Google Maps scraping task: {str(e)}")
