@@ -8,10 +8,6 @@ EMAIL_ACCOUNTS = [
         'username': 'mwprac47@gmail.com',
         'password': 'txghrfzssgaordqh'
     },
-    {
-        'username': 'joeq1839@gmail.com', 
-        'password': 'funrhujnhsuwmma'
-    },
 ]
 
 all_emails = []

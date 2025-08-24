@@ -8,6 +8,9 @@ from typing import List, Optional, Any, Dict
 from datetime import timedelta
 from datetime import datetime
 from pydantic import BaseModel, Field, EmailStr, validator
+from imap_tools import MailBox
+import email.utils
+import threading
 from fastapi import FastAPI, HTTPException, BackgroundTasks, status, Depends
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
@@ -113,6 +116,11 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
 EMAIL_REGEX = r'^[\w\.-]+@[\w\.-]+\.\w+$'
 
 def is_valid_email(email: str) -> bool:
+    if not email or not isinstance(email, str):
+        return False
+    email = email.strip()
+    if not email:
+        return False
     return re.match(EMAIL_REGEX, email) is not None
 
 def oid(id_str: str) -> ObjectId:
@@ -150,12 +158,27 @@ class TemplateOut(TemplateIn):
     id: str
     created_at: datetime
     user_id: str
+    
+class UnreadEmail(BaseModel):
+    sender_email: str
+    recipient_email: str
+    subject: str
+    time: str
+    preview: str
 
 class LeadIn(BaseModel):
     company_name: Optional[str] = None
     contact_number: Optional[str] = None
-    email: Optional[EmailStr] = None
+    email: Optional[EmailStr] = None  # This uses EmailStr which provides basic validation
     owner_name: Optional[str] = None
+
+    @validator('email', pre=True, always=True)
+    def validate_email(cls, v):
+        if v is None or v == '':
+            return None
+        if not is_valid_email(v):
+            return None  # Or raise validation error if you prefer
+        return v
 
 class LeadOut(LeadIn):
     id: str
@@ -171,7 +194,6 @@ class EmailAccountIn(BaseModel):
     email: EmailStr
     password: str = Field(..., description="App password for the email account")
     sender_name: Optional[str] = None
-    daily_limit: int = Field(100, ge=1, description="Maximum emails to send per day")
     is_active: bool = True
 
 class EmailAccountOut(EmailAccountIn):
@@ -240,32 +262,108 @@ def setup_rephrase_agent():
 
 rephrase_agent = setup_rephrase_agent()
 
+async def check_unread_emails(user_id: str, max_emails: int = 10) -> List[Dict[str, Any]]:
+    """Fetch recent emails (read or unread) for all email accounts of a user"""
+    print(f"🔍 Starting recent email check for user_id: {user_id}, max_emails: {max_emails}")
+    
+    # Get all email accounts for the user
+    email_accounts = await email_accounts_col.find({
+        "user_id": user_id,
+        "is_active": True
+    }).to_list(length=None)
+    
+    print(f"📧 Found {len(email_accounts)} active email accounts for user")
+    for i, acc in enumerate(email_accounts):
+        print(f"  Account {i+1}: {acc.get('email', 'No email')} (ID: {acc.get('_id', 'No ID')})")
+    
+    recent_emails = []
+    emails_lock = threading.Lock()
+    
+    def process_email_account(account):
+        nonlocal recent_emails
+        account_email = account.get("email", "Unknown")
+        print(f"🔎 Checking account: {account_email}")
+        
+        try:
+            print(f"🔄 Connecting to IMAP server for {account_email}")
+            with MailBox("imap.gmail.com").login(account["email"], account["password"], "INBOX") as mailbox:
+                print(f"✅ Successfully connected to {account_email}")
+                
+                # Fetch recent emails (read + unread)
+                emails_found = 0
+                for msg in mailbox.fetch(criteria="ALL", limit=max_emails, reverse=True):  
+                    emails_found += 1
+                    sender_name, sender_email = email.utils.parseaddr(msg.from_)
+                    email_time = msg.date.strftime("%d-%m-%Y %I:%M:%p") if msg.date else "Unknown"
+                    
+                    # Get first 100 chars as preview
+                    preview = msg.text or msg.html or ""
+                    if preview:
+                        preview = preview[:100] + "..." if len(preview) > 100 else preview
+                    
+                    with emails_lock:
+                        recent_emails.append({
+                            "sender_email": sender_email,
+                            "recipient_email": account["email"],
+                            "subject": msg.subject or "No Subject",
+                            "time": email_time,
+                            "preview": preview,
+                            "is_unread": "\\Seen" not in msg.flags  # mark unread flag
+                        })
+                    
+                    print(f"📩 Found email from {sender_email} to {account_email} at {email_time} | Flags: {msg.flags}")
+                
+                if emails_found == 0:
+                    print(f"ℹ️ No emails found for {account_email}")
+                else:
+                    print(f"✅ Found {emails_found} recent emails for {account_email}")
+                    
+        except Exception as e:
+            error_msg = str(e)
+            print(f"❌ Error checking emails for {account_email}: {error_msg}")
+            if "Authentication failed" in error_msg:
+                print(f"🔐 Authentication issue with {account_email}. Check password/app password.")
+            elif "connection failed" in error_msg.lower():
+                print(f"🌐 Connection issue with {account_email}. Check network/IMAP settings.")
+            elif "SSL" in error_msg:
+                print(f"🔒 SSL issue with {account_email}. Check port/SSL configuration.")
+    
+    # Create threads for each email account
+    threads = []
+    print(f"🧵 Creating threads for {len(email_accounts)} email accounts")
+    
+    for account in email_accounts:
+        thread = threading.Thread(target=process_email_account, args=(account,))
+        thread.start()
+        threads.append(thread)
+        print(f"➡️ Started thread for account: {account.get('email', 'Unknown')}")
+    
+    # Wait for all threads to complete
+    print("⏳ Waiting for all email accounts to be checked...")
+    for i, thread in enumerate(threads):
+        thread.join(timeout=30)
+        if thread.is_alive():
+            print(f"⏰ Thread {i+1} timed out after 30 seconds")
+        else:
+            print(f"✅ Thread {i+1} completed successfully")
+    
+    # Sort by time (newest first) and limit to max_emails
+    print(f"📊 Sorting {len(recent_emails)} found emails by time")
+    recent_emails.sort(key=lambda x: x.get("time", ""), reverse=True)
+    result = recent_emails[:max_emails]
+    
+    print(f"🎉 Recent email check completed. Returning {len(result)} emails")
+    return result
+
 # --------------------
 # Email Account Management
 # --------------------
 async def get_available_email_accounts(user_id: str) -> List[Dict[str, Any]]:
-    """Get all active email accounts that haven't reached their daily limit for a specific user"""
-    # First, check if we need to reset daily counts
-    today = datetime.utcnow().date()
-    
-    # Find accounts that need reset
-    accounts_to_reset = await email_accounts_col.find({
-        "user_id": user_id,
-        "last_reset_date": {"$lt": datetime(today.year, today.month, today.day)}
-    }).to_list(length=None)
-    
-    # Reset counts for these accounts
-    if accounts_to_reset:
-        await email_accounts_col.update_many(
-            {"_id": {"$in": [acc["_id"] for acc in accounts_to_reset]}},
-            {"$set": {"emails_sent_today": 0, "last_reset_date": datetime.utcnow()}}
-        )
-    
-    # Get all active accounts that haven't reached their daily limit
+    """Get all active email accounts for a specific user (no daily limit checks)"""
+    # Get all active accounts
     cursor = email_accounts_col.find({
         "user_id": user_id,
-        "is_active": True,
-        "emails_sent_today": {"$lt": "$daily_limit"}
+        "is_active": True
     })
     
     accounts = []
@@ -275,11 +373,9 @@ async def get_available_email_accounts(user_id: str) -> List[Dict[str, Any]]:
     return accounts
 
 async def update_email_account_usage(account_id: ObjectId, emails_sent: int):
-    """Update the count of emails sent for an account"""
-    await email_accounts_col.update_one(
-        {"_id": account_id},
-        {"$inc": {"emails_sent_today": emails_sent}}
-    )
+    """Update the count of emails sent for an account - now a no-op"""
+    # No longer tracking usage, so this function does nothing
+    pass
 
 # --------------------
 # Authentication Endpoints
@@ -379,10 +475,9 @@ def send_bulk_via_smtp_blocking(
     messages: List[Dict[str, Any]], 
     delay: float = 1.0
 ) -> Dict[str, Any]:
-    """Send emails using multiple accounts with round-robin distribution"""
+    """Send emails using multiple accounts with round-robin distribution (no daily limits)"""
     sent = []
     failed = []
-    account_usage = {acc["_id"]: 0 for acc in email_accounts}
     
     # Create SMTP connections for each account
     connections = {}
@@ -415,12 +510,6 @@ def send_bulk_via_smtp_blocking(
         if not account:
             continue
             
-        # Check if account has reached its daily limit
-        if account["emails_sent_today"] + account_usage[account["_id"]] >= account["daily_limit"]:
-            # Skip this account, try next one
-            current_account_index = (current_account_index + 1) % len(account_ids)
-            continue
-            
         try:
             msgstr = build_message(
                 account["email"], 
@@ -432,7 +521,6 @@ def send_bulk_via_smtp_blocking(
             )
             connections[account_id].sendmail(account["email"], m["to"], msgstr)
             sent.append({"email": m["to"], "account_id": str(account["_id"])})
-            account_usage[account["_id"]] += 1
             print(f"Sent email to {m['to']} using account {account['email']}")
         except Exception as e:
             error_msg = str(e)
@@ -464,7 +552,7 @@ def send_bulk_via_smtp_blocking(
         except:
             pass
     
-    return {"sent": sent, "failed": failed, "account_usage": account_usage}
+    return {"sent": sent, "failed": failed}
 
 async def mark_leads_sent(lead_ids: List[str], user_id: str):
     oids = []
@@ -485,28 +573,45 @@ async def background_send(template_id: str, lead_ids: List[str], user_id: str, a
     if not tmpl:
         return {"status": "template_not_found"}
 
-    q = {"_id": {"$in": [ObjectId(l) for l in lead_ids if ObjectId.is_valid(l)]}, "user_id": user_id}
+    # Convert lead IDs to ObjectIds
+    lead_object_ids = []
+    for lid in lead_ids:
+        try:
+            if ObjectId.is_valid(lid):
+                lead_object_ids.append(ObjectId(lid))
+        except Exception:
+            continue
+    
+    if not lead_object_ids:
+        return {"status": "no_valid_leads"}
+    
+    q = {"_id": {"$in": lead_object_ids}, "user_id": user_id}
     leads_cursor = leads_col.find(q)
     leads = []
     async for l in leads_cursor:
         leads.append(l)
 
     messages = []
+    valid_leads = []
     for l in leads:
         recipient = l.get("email")
+        # Skip leads without email or with invalid email
         if not recipient or not is_valid_email(recipient):
             continue
+        
         body = tmpl.get("content", "")
         first = l["owner_name"].split()[0] if l.get("owner_name") else ""
         body = body.replace("{First Name}", first)
         body = body.replace("{Company}", l.get("company_name", ""))
         subject = tmpl.get("subject", "")
+        
         messages.append({
             "to": recipient, 
             "subject": subject, 
             "body": body,
             "attachments": attachments
         })
+        valid_leads.append(l)
 
     if not messages:
         return {"status": "no_valid_recipients"}
@@ -534,16 +639,11 @@ async def background_send(template_id: str, lead_ids: List[str], user_id: str, a
         SMTP_DELAY
     )
 
-    # Update tracking of sent emails and account usage
+    # Update tracking of sent emails
     sent_emails = [s["email"] for s in result.get("sent", [])]
-    sent_lead_ids = [str(l["_id"]) for l in leads if l.get("email") in sent_emails]
+    sent_lead_ids = [str(l["_id"]) for l in valid_leads if l.get("email") in sent_emails]
     if sent_lead_ids:
         await mark_leads_sent(sent_lead_ids, user_id)
-    
-    # Update account usage counts
-    for account_id, count in result.get("account_usage", {}).items():
-        if count > 0:
-            await update_email_account_usage(ObjectId(account_id), count)
 
     await mail_logs_col.insert_one({
         "template_id": template_id,
@@ -552,7 +652,9 @@ async def background_send(template_id: str, lead_ids: List[str], user_id: str, a
         "failed": result.get("failed", []),
         "created_at": datetime.utcnow(),
         "had_attachments": bool(attachments),
-        "accounts_used": [str(acc["_id"]) for acc in email_accounts]
+        "accounts_used": [str(acc["_id"]) for acc in email_accounts],
+        "total_leads_processed": len(leads),
+        "valid_leads_count": len(valid_leads)
     })
     return result
 
@@ -738,6 +840,22 @@ async def get_email_accounts(active_only: bool = True, current_user: dict = Depe
         accounts.append(serialize_doc(acc))
     return accounts
 
+@app.get("/unread-emails", response_model=List[UnreadEmail])
+async def get_unread_emails(max_emails: int = 10, current_user: dict = Depends(get_current_user)):
+    """Get unread emails from all email accounts"""
+    print(f"📨 API request for unread emails from user: {current_user['email']}")
+    try:
+        unread_emails = await check_unread_emails(str(current_user["_id"]), max_emails)
+        print(f"✅ API request completed. Returning {len(unread_emails)} emails")
+        return unread_emails
+    except Exception as e:
+        print(f"❌ API error: {str(e)}")
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch unread emails"
+        )
+
 @app.post("/email-accounts", response_model=EmailAccountOut, status_code=status.HTTP_201_CREATED)
 async def create_email_account(payload: EmailAccountIn, current_user: dict = Depends(get_current_user)):
     # Check if email already exists for this user
@@ -747,8 +865,6 @@ async def create_email_account(payload: EmailAccountIn, current_user: dict = Dep
     
     doc = payload.dict()
     doc["created_at"] = datetime.utcnow()
-    doc["last_reset_date"] = datetime.utcnow()
-    doc["emails_sent_today"] = 0
     doc["smtp_host"] = SMTP_HOST
     doc["smtp_port"] = SMTP_PORT
     doc["user_id"] = str(current_user["_id"])
@@ -772,16 +888,6 @@ async def delete_email_account(account_id: str, current_user: dict = Depends(get
     if res.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Email account not found")
     return {"status": "deleted"}
-
-@app.post("/email-accounts/{account_id}/reset")
-async def reset_email_account_usage(account_id: str, current_user: dict = Depends(get_current_user)):
-    res = await email_accounts_col.update_one(
-        {"_id": oid(account_id), "user_id": str(current_user["_id"])},
-        {"$set": {"emails_sent_today": 0, "last_reset_date": datetime.utcnow()}}
-    )
-    if res.matched_count == 0:
-        raise HTTPException(status_code=404, detail="Email account not found")
-    return {"status": "reset"}
 
 # --------------------
 # Analytics Endpoints
@@ -975,11 +1081,8 @@ async def seed_dev():
                 "email": "example1@gmail.com",
                 "password": "your_app_password_here",
                 "sender_name": "Sales Team",
-                "daily_limit": 100,
                 "is_active": True,
                 "created_at": datetime.utcnow(),
-                "last_reset_date": datetime.utcnow(),
-                "emails_sent_today": 0,
                 "smtp_host": SMTP_HOST,
                 "smtp_port": SMTP_PORT,
                 "user_id": user_id
@@ -988,6 +1091,64 @@ async def seed_dev():
         await email_accounts_col.insert_many(sample_accounts)
     
     return {"status": "seeded", "user_id": user_id}
+
+# --------------------
+# Google Maps Scraping Endpoints
+# --------------------
+@app.post("/scrape-google-maps", response_model=ScrapeResponse)
+async def scrape_google_maps_endpoint(request: ScrapeRequest, background_tasks: BackgroundTasks, current_user: dict = Depends(get_current_user)):
+    try:
+        # Start the scraping in the background
+        background_tasks.add_task(
+            save_google_scraped_data_to_db,
+            request.query,
+            request.max_businesses,
+            str(current_user["_id"])
+        )
+        
+        return {
+            "status": "started",
+            "message": f"Google Maps scraping started for '{request.query}'. Results will be saved to database.",
+            "total_requested": request.max_businesses
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+async def save_google_scraped_data_to_db(query: str, max_businesses: int, user_id: str):
+    """Background task that performs Google Maps scraping and saves to DB"""
+    try:
+        # Import the Google Maps scraping function
+        from google_scraper import scrape_google_maps
+        
+        results = scrape_google_maps(query, max_businesses)
+        
+        # Convert to lead format for your database
+        leads_to_insert = []
+        for business in results:
+            lead = {
+                "company_name": business.get("company_name", ""),
+                "contact_number": business.get("phone", ""),
+                "email": business.get("emails", [""])[0] if business.get("emails") else None,
+                "owner_name": "",  # Can't get this from Google Maps
+                "mail_sent": False,
+                "created_at": datetime.utcnow(),
+                "user_id": user_id,
+                "source": "google_maps_scraper",
+                "website": business.get("website", ""),
+                "additional_info": {
+                    "all_emails": business.get("emails", []),
+                    "scraped_with_proxy": True
+                }
+            }
+            leads_to_insert.append(lead)
+        
+        if leads_to_insert:
+            await leads_col.insert_many(leads_to_insert)
+            print(f"✅ Saved {len(leads_to_insert)} Google Maps leads to database")
+        
+    except Exception as e:
+        print(f"❌ Error in background Google Maps scraping task: {str(e)}")
+        traceback.print_exc()
 
 @app.get("/")
 async def root():
