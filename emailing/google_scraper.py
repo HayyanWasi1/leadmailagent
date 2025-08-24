@@ -1215,7 +1215,6 @@ def click_more_businesses_and_navigate(driver):
             body.send_keys(Keys.PAGE_DOWN)
             time.sleep(random.uniform(0.5, 1.5))
         
-        # Wait for and find the "More businesses" link using the correct selector
         more_businesses_selectors = [
             "//span[text()='More businesses']/ancestor::a",
             "//span[contains(@class, 'tJaMb') and contains(text(), 'More businesses')]/ancestor::a",
@@ -1361,6 +1360,7 @@ def scrape_google_maps(query, max_businesses):
                         try:
                             # Prioritized selectors based on the HTML structure you provided
                             name_selectors = [
+                                'span.OSrXXb',  # ADD THIS LINE - matches your HTML exactly
                                 'h2[data-attrid="title"] span',  # Direct match for your HTML structure
                                 'h2.qrShPb span',  # Class-based selector
                                 'h2[class*="qrShPb"] span',  # Partial class match
@@ -1498,7 +1498,7 @@ def scrape_google_maps(query, max_businesses):
                             driver.switch_to.window(driver.window_handles[0])
                     else:
                         print(" No website found for this business")
-                    
+            
                     results.append(business_data)
                     total_processed += 1
                     print(f" Completed business: {business_data['company_name']}")
