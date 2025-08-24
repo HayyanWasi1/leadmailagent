@@ -817,12 +817,6 @@ export default function SendEmails() {
                     <span className="px-2 py-1 rounded text-xs bg-green-100 text-green-800">
                       {account.emails_sent_today} sent
                     </span>
-                    <button
-                      onClick={() => handleResetAccount(account.id)}
-                      className="text-xs text-blue-600 hover:text-blue-800"
-                    >
-                      Reset
-                    </button>
                   </div>
                 </div>
               ))}

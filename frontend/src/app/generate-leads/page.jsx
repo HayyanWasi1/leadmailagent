@@ -1,21 +1,27 @@
 'use client';
-import { useState, useEffect } from 'react';
-import Head from 'next/head';
+
+import React, { useState, useEffect, useRef } from 'react';
 import toast, { Toaster } from 'react-hot-toast';
 
-export default function GoogleMapsScraper() {
+const GoogleMapsScraper = () => {
+  // State for form inputs
   const [query, setQuery] = useState('');
   const [maxBusinesses, setMaxBusinesses] = useState(10);
+  // State for scraping process
   const [isScraping, setIsScraping] = useState(false);
   const [scrapeProgress, setScrapeProgress] = useState({
     scraped: 0,
     total: 0,
-    status: 'idle'
+    status: 'idle' // 'idle', 'starting', 'in_progress', 'complete', 'error'
   });
+  // State for displaying leads
   const [recentLeads, setRecentLeads] = useState([]);
   const [isLoadingLeads, setIsLoadingLeads] = useState(true);
 
-  // Function to get auth token from localStorage
+  // Use a ref to hold the polling interval so we can clear it later.
+  const pollingIntervalRef = useRef(null);
+
+  // Helper function to get the authentication token from local storage.
   const getAuthToken = () => {
     if (typeof window !== 'undefined') {
       return localStorage.getItem('token');
@@ -23,31 +29,43 @@ export default function GoogleMapsScraper() {
     return null;
   };
 
+  // Effect to fetch recent leads on component mount and whenever a scrape completes.
   useEffect(() => {
     fetchRecentLeads();
+
+    // Cleanup function for the interval on component unmount.
+    return () => {
+      if (pollingIntervalRef.current) {
+        clearInterval(pollingIntervalRef.current);
+      }
+    };
   }, []);
 
+  /**
+   * Fetches the 10 most recent unsent leads from the backend API.
+   * Displays an error toast if the fetch fails.
+   */
   const fetchRecentLeads = async () => {
     try {
       setIsLoadingLeads(true);
       const token = getAuthToken();
       if (!token) {
-        throw new Error('No authentication token found');
+        throw new Error('No authentication token found. Please log in.');
       }
 
-      const response = await fetch('http://127.0.0.1:8000/leads?limit=10&sent=false', {
+      const response = await fetch('http://localhost:8000/leads?limit=10&sent=false', {
         headers: {
           'Authorization': `Bearer ${token}`,
         }
       });
-      
+
       if (!response.ok) {
         if (response.status === 401) {
           throw new Error('Authentication failed. Please log in again.');
         }
         throw new Error(`Failed to fetch leads: ${response.statusText}`);
       }
-      
+
       const leads = await response.json();
       setRecentLeads(leads);
     } catch (error) {
@@ -58,23 +76,27 @@ export default function GoogleMapsScraper() {
     }
   };
 
+  /**
+   * Starts the Google Maps scraping process by making a POST request to the backend.
+   * Handles validation and updates the UI state.
+   */
   const startScraping = async () => {
+    // Input validation
     if (!query.trim()) {
       toast.error('Please enter a search query');
       return;
     }
-
     if (maxBusinesses < 1 || maxBusinesses > 100) {
       toast.error('Please enter a number between 1 and 100');
       return;
     }
-
     const token = getAuthToken();
     if (!token) {
       toast.error('Please log in to start scraping');
       return;
     }
 
+    // Set UI state to indicate scraping has started
     setIsScraping(true);
     setScrapeProgress({
       scraped: 0,
@@ -83,7 +105,7 @@ export default function GoogleMapsScraper() {
     });
 
     try {
-      const response = await fetch('http://127.0.0.1:8000/scrape-google-maps', {
+      const response = await fetch('http://localhost:8000/scrape-google-maps', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -110,7 +132,7 @@ export default function GoogleMapsScraper() {
         status: 'in_progress'
       }));
 
-      // Start polling for progress
+      // Start polling for progress after a successful API call
       startProgressPolling(maxBusinesses);
     } catch (error) {
       toast.error(error.message || 'Failed to start scraping');
@@ -123,18 +145,27 @@ export default function GoogleMapsScraper() {
     }
   };
 
+  /**
+   * Polls the backend API at a regular interval to check for scraping progress.
+   * Clears the interval when the scraping is complete or an error occurs.
+   */
   const startProgressPolling = (total) => {
-    const interval = setInterval(async () => {
+    // Clear any existing interval to prevent multiple polling loops.
+    if (pollingIntervalRef.current) {
+      clearInterval(pollingIntervalRef.current);
+    }
+
+    const intervalId = setInterval(async () => {
       try {
         const token = getAuthToken();
         if (!token) {
-          clearInterval(interval);
+          clearInterval(intervalId);
           toast.error('Authentication lost. Please log in again.');
           return;
         }
 
         // Get count of unsent leads (newly scraped ones)
-        const countRes = await fetch('http://127.0.0.1:8000/leads/count?sent=false', {
+        const countRes = await fetch('http://localhost:8000/leads/count?sent=false', {
           headers: {
             'Authorization': `Bearer ${token}`,
           }
@@ -142,7 +173,7 @@ export default function GoogleMapsScraper() {
 
         if (!countRes.ok) {
           if (countRes.status === 401) {
-            clearInterval(interval);
+            clearInterval(intervalId);
             toast.error('Authentication failed. Please log in again.');
             return;
           }
@@ -152,8 +183,7 @@ export default function GoogleMapsScraper() {
         const countData = await countRes.json();
         const newLeads = countData.count;
 
-        let shouldComplete = false;
-
+        // Update the progress state
         setScrapeProgress(prev => {
           const newProgress = {
             ...prev,
@@ -161,31 +191,41 @@ export default function GoogleMapsScraper() {
             total: total
           };
 
-          if (newLeads >= total || prev.scraped === newLeads) {
-            if (prev.scraped === newLeads && prev.status === 'in_progress') {
-              newProgress.status = 'complete';
-              shouldComplete = true;
-            }
+          // Check for completion criteria
+          if (newLeads >= total) {
+            newProgress.status = 'complete';
+            return newProgress;
+          } else {
+            return newProgress;
           }
-          return newProgress;
         });
 
-        if (shouldComplete) {
+        // Check again after state update to see if we should stop polling
+        if (newLeads >= total) {
           setIsScraping(false);
-          clearInterval(interval);
-          fetchRecentLeads();
-          toast.success(`Scraping completed! Found ${newLeads} businesses`);
+          clearInterval(intervalId);
+          fetchRecentLeads(); // Fetch the new leads to display in the table
+          toast.success(`Scraping completed! Found ${newLeads} businesses.`);
         }
       } catch (error) {
         console.error('Error polling progress:', error);
-        if (error.message.includes('Authentication')) {
-          clearInterval(interval);
-          toast.error(error.message);
-        }
+        toast.error(error.message || 'An error occurred during scraping.');
+        setIsScraping(false);
+        clearInterval(intervalId);
+        setScrapeProgress({
+          scraped: 0,
+          total: 0,
+          status: 'error'
+        });
       }
     }, 3000); // Poll every 3 seconds
+
+    pollingIntervalRef.current = intervalId;
   };
 
+  /**
+   * Returns a user-friendly status message based on the scraping progress.
+   */
   const getStatusMessage = () => {
     switch (scrapeProgress.status) {
       case 'starting':
@@ -193,7 +233,7 @@ export default function GoogleMapsScraper() {
       case 'in_progress':
         return `Scraping in progress: ${scrapeProgress.scraped}/${scrapeProgress.total} businesses found`;
       case 'complete':
-        return `Scraping complete! Found ${scrapeProgress.scraped} businesses`;
+        return `Scraping complete! Found ${scrapeProgress.scraped} businesses.`;
       case 'error':
         return 'Scraping failed. Please try again.';
       default:
@@ -201,60 +241,67 @@ export default function GoogleMapsScraper() {
     }
   };
 
+  /**
+   * Calculates the percentage of scraping progress for the progress bar.
+   */
   const getProgressPercentage = () => {
     if (scrapeProgress.total === 0) return 0;
     return Math.min(100, (scrapeProgress.scraped / scrapeProgress.total) * 100);
   };
 
+  /**
+   * Helper function to format phone numbers for display.
+   */
   const formatPhoneNumber = (phone) => {
-    if (!phone || phone === 'Not found') return 'N/A';
-    return phone;
+    return phone && phone !== 'Not found' ? phone : 'N/A';
   };
 
+  /**
+   * Helper function to truncate long text strings for table display.
+   */
   const truncateText = (text, maxLength = 25) => {
     if (!text) return 'N/A';
     return text.length > maxLength ? text.substring(0, maxLength) + '...' : text;
   };
 
   return (
-    <div className="min-h-screen bg-gray-50 p-8">
-      <Head>
-        <title>Google Maps Scraper - Email Agent</title>
-      </Head>
+    <div className="min-h-screen bg-gray-50 p-6 sm:p-8 font-sans">
       <Toaster position="top-right" />
 
-      <div className="max-w-6xl mx-auto">
+      <div className="max-w-7xl mx-auto">
         {/* Header */}
         <div className="mb-8">
-          <h1 className="text-3xl font-bold text-gray-800 mb-2">Google Maps Scraper</h1>
-          <p className="text-gray-600">Find businesses and extract contact information from Google Maps</p>
+          <h1 className="text-3xl font-bold text-gray-800 mb-2">Google Maps Scraper 🗺️</h1>
+          <p className="text-gray-600">Find and extract business contact information from Google Maps.</p>
         </div>
 
         {/* Scraping Form */}
-        <div className="bg-white rounded-xl border border-gray-200 shadow-sm p-6 mb-8">
-          <h2 className="text-xl font-semibold text-gray-800 mb-6">Start New Scraping</h2>
+        <div className="bg-white rounded-xl border border-gray-200 shadow-lg p-6 mb-8">
+          <h2 className="text-xl font-semibold text-gray-800 mb-6 flex items-center gap-2">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-6 h-6 text-indigo-600">
+              <path fillRule="evenodd" d="M10.5 3.75a6.75 6.75 0 1 0 0 13.5 6.75 6.75 0 0 0 0-13.5ZM2.25 10.5a8.25 8.25 0 1 1 14.59 5.28l4.698 4.698a.75.75 0 1 1-1.06 1.06l-4.698-4.698A8.25 8.25 0 0 1 2.25 10.5Z" clipRule="evenodd" />
+            </svg>
+            Start a New Search
+          </h2>
 
           <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-2">
-                Search Query *
+                Search Query
               </label>
               <input
                 type="text"
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
-                placeholder="e.g., 'restaurants in London', 'dentists in New York'"
-                className="w-full rounded-md border-gray-300 shadow-sm p-3 border focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+                placeholder="e.g., 'restaurants in London'"
+                className="w-full rounded-lg border-gray-300 shadow-sm p-3 border focus:ring-2 focus:ring-indigo-500 focus:border-transparent transition"
                 disabled={isScraping}
               />
-              <p className="text-xs text-gray-500 mt-1">
-                What type of businesses are you looking for?
-              </p>
             </div>
 
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-2">
-                Number of Businesses *
+                Number of Businesses
               </label>
               <input
                 type="number"
@@ -264,12 +311,9 @@ export default function GoogleMapsScraper() {
                 }
                 min="1"
                 max="100"
-                className="w-full rounded-md border-gray-300 shadow-sm p-3 border focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+                className="w-full rounded-lg border-gray-300 shadow-sm p-3 border focus:ring-2 focus:ring-indigo-500 focus:border-transparent transition"
                 disabled={isScraping}
               />
-              <p className="text-xs text-gray-500 mt-1">
-                Maximum 100 businesses per search
-              </p>
             </div>
           </div>
 
@@ -277,7 +321,7 @@ export default function GoogleMapsScraper() {
             <button
               onClick={startScraping}
               disabled={isScraping || !query.trim()}
-              className="w-full bg-indigo-600 text-white py-3 px-6 rounded-md hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors duration-200 font-medium"
+              className="w-full bg-indigo-600 text-white py-3 px-6 rounded-lg hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors duration-200 font-medium shadow-md"
             >
               {isScraping ? (
                 <div className="flex items-center justify-center">
@@ -291,13 +335,16 @@ export default function GoogleMapsScraper() {
           </div>
 
           {/* Progress Section */}
-          {(isScraping || scrapeProgress.status === 'complete') && (
-            <div className="mt-6 p-4 bg-gray-50 rounded-lg border">
+          {(isScraping || scrapeProgress.status !== 'idle') && (
+            <div className="mt-6 p-4 bg-gray-50 rounded-lg border border-gray-200">
               <div className="flex justify-between items-center mb-3">
                 <span className="text-sm font-medium text-gray-700">
+                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-4 h-4 inline-block mr-1 text-gray-500">
+                    <path fillRule="evenodd" d="M12 2.25c-5.385 0-9.75 4.365-9.75 9.75s4.365 9.75 9.75 9.75 9.75-4.365 9.75-9.75S17.385 2.25 12 2.25ZM12.75 6a.75.75 0 0 0-1.5 0v6a.75.75 0 0 0 .231.53l5.004 5.005a.75.75 0 0 0 1.06-1.06l-4.25-4.249V6Z" clipRule="evenodd" />
+                  </svg>
                   {getStatusMessage()}
                 </span>
-                <span className="text-sm text-gray-600">
+                <span className="text-sm text-gray-600 font-semibold">
                   {Math.round(getProgressPercentage())}%
                 </span>
               </div>
@@ -308,33 +355,24 @@ export default function GoogleMapsScraper() {
                   style={{ width: `${getProgressPercentage()}%` }}
                 ></div>
               </div>
-
+              
               <div className="text-xs text-gray-500 space-y-1">
-                <p>• This may take several minutes depending on the number of businesses</p>
-                <p>• Do not close this window while scraping is in progress</p>
-                <p>• Results will be automatically saved to your leads database</p>
+                <p>• This may take several minutes depending on the number of businesses.</p>
+                <p>• Do not close this window while scraping is in progress.</p>
               </div>
-
-              {scrapeProgress.status === 'complete' && (
-                <div className="mt-4 p-3 bg-green-50 border border-green-200 rounded-md">
-                  <div className="flex items-center">
-                    <svg className="w-5 h-5 text-green-600 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
-                    </svg>
-                    <span className="text-green-800 font-medium">Scraping completed successfully!</span>
-                  </div>
-                  <p className="text-green-700 text-sm mt-1">
-                    Found {scrapeProgress.scraped} businesses. You can now send emails from the main dashboard.
-                  </p>
-                </div>
-              )}
             </div>
           )}
         </div>
 
         {/* Recent Leads Section */}
-        <div className="bg-white rounded-xl border border-gray-200 shadow-sm p-6">
-          <h2 className="text-xl font-semibold text-gray-800 mb-6">Recent Leads</h2>
+        <div className="bg-white rounded-xl border border-gray-200 shadow-lg p-6">
+          <h2 className="text-xl font-semibold text-gray-800 mb-6 flex items-center gap-2">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-6 h-6 text-indigo-600">
+              <path fillRule="evenodd" d="M11.54 22.351A8.25 8.25 0 0 1 18 20.25h.75a6 6 0 0 0 0-12H18a8.25 8.25 0 0 1-6.46-2.851A8.25 8.25 0 0 0 5.25 6.75v1.5a.75.75 0 0 1-1.5 0v-1.5a8.25 8.25 0 0 1 8.25-8.25Z" clipRule="evenodd" />
+              <path fillRule="evenodd" d="M12 11.25a.75.75 0 0 1 .75.75v5.757l2.247-2.248a.75.75 0 0 1 1.06 1.06l-3.5 3.5a.75.75 0 0 1-1.06 0l-3.5-3.5a.75.75 0 1 1 1.06-1.06l2.248 2.247V12a.75.75 0 0 1 .75-.75Z" clipRule="evenodd" />
+            </svg>
+            Recent Leads
+          </h2>
           
           {isLoadingLeads ? (
             <div className="flex justify-center items-center py-8">
@@ -362,7 +400,7 @@ export default function GoogleMapsScraper() {
                   </thead>
                   <tbody className="bg-white divide-y divide-gray-200">
                     {recentLeads.map((lead, index) => (
-                      <tr key={index} className="hover:bg-gray-50">
+                      <tr key={index} className="hover:bg-gray-50 transition-colors">
                         <td className="px-6 py-4 whitespace-nowrap">
                           <div className="text-sm font-medium text-gray-900">
                             {truncateText(lead.company_name, 30)}
@@ -388,20 +426,11 @@ export default function GoogleMapsScraper() {
                   </tbody>
                 </table>
               </div>
-              <div className="mt-4 flex justify-between items-center text-sm text-gray-500">
-                <span>Showing {recentLeads.length} most recent leads</span>
-                <a
-                  href="/send-emails"
-                  className="text-indigo-600 hover:text-indigo-700 font-medium"
-                >
-                  Go to Email Dashboard →
-                </a>
-              </div>
             </>
           ) : (
             <div className="text-center py-8">
-              <svg className="mx-auto h-12 w-12 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" />
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="mx-auto h-12 w-12 text-gray-400">
+                <path d="M11.47 1.72a.75.75 0 0 0-1.06 0L1.97 9.18a.75.75 0 0 0 1.06 1.06l.72-.72v5.19a3 3 0 0 0 3 3h5.25a.75.75 0 0 0 0-1.5H7.75a1.5 1.5 0 0 1-1.5-1.5v-5.19l3.72 3.72a.75.75 0 0 0 1.06 0l5.25-5.25Zm0 12.72v4.56a3 3 0 0 0 3 3h5.25a.75.75 0 0 0 0-1.5h-5.25a1.5 1.5 0 0 1-1.5-1.5v-4.56l3.72 3.72a.75.75 0 0 0 1.06 0l.72-.72a.75.75 0 0 0 0-1.06l-5.25-5.25a.75.75 0 0 0-1.06 0l-.72.72v-1.94a3 3 0 0 0-3-3h-5.25a.75.75 0 0 0 0 1.5H5.75a1.5 1.5 0 0 1 1.5 1.5v1.94l-3.72-3.72a.75.75 0 0 0-1.06 0L1.97 9.18a.75.75 0 0 0 1.06 1.06l.72-.72v5.19a3 3 0 0 0 3 3h5.25a.75.75 0 0 0 0-1.5h-5.25a1.5 1.5 0 0 1-1.5-1.5v-5.19l3.72 3.72a.75.75 0 0 0 1.06 0Z" />
               </svg>
               <h3 className="mt-2 text-sm font-medium text-gray-900">No leads yet</h3>
               <p className="mt-1 text-sm text-gray-500">
@@ -413,4 +442,6 @@ export default function GoogleMapsScraper() {
       </div>
     </div>
   );
-}
+};
+
+export default GoogleMapsScraper;
