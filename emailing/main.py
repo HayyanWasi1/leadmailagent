@@ -791,6 +791,28 @@ async def create_lead(payload: LeadIn, current_user: dict = Depends(get_current_
     created = await leads_col.find_one({"_id": r.inserted_id})
     return serialize_doc(created)
 
+@app.post("/leads/manual", response_model=LeadOut, status_code=status.HTTP_201_CREATED)
+async def create_lead_manual(payload: LeadIn, current_user: dict = Depends(get_current_user)):
+    """
+    Create a single lead manually
+    """
+    # Validate email if provided
+    if payload.email and not is_valid_email(payload.email):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid email format"
+        )
+    
+    doc = payload.dict()
+    doc["mail_sent"] = False
+    doc["created_at"] = datetime.utcnow()
+    doc["user_id"] = str(current_user["_id"])
+    doc["source"] = "manual_entry"
+    
+    r = await leads_col.insert_one(doc)
+    created = await leads_col.find_one({"_id": r.inserted_id})
+    return serialize_doc(created)
+
 @app.post("/send-emails")
 async def send_emails(payload: SendEmailsPayload, background_tasks: BackgroundTasks, current_user: dict = Depends(get_current_user)):
     try:
