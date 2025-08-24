@@ -3,7 +3,7 @@ import { useState, useEffect } from 'react';
 import Head from 'next/head';
 import toast, { Toaster } from 'react-hot-toast';
 
-export default function GoogleMapsScraper() {
+export default function BingMapsScraper() {
   const [query, setQuery] = useState('');
   const [maxBusinesses, setMaxBusinesses] = useState(10);
   const [isScraping, setIsScraping] = useState(false);
@@ -21,6 +21,15 @@ export default function GoogleMapsScraper() {
       return localStorage.getItem('token');
     }
     return null;
+  };
+
+  // Function to get headers with authentication
+  const getAuthHeaders = () => {
+    const token = getAuthToken();
+    return {
+      'Authorization': `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    };
   };
 
   useEffect(() => {
@@ -83,7 +92,7 @@ export default function GoogleMapsScraper() {
     });
 
     try {
-      const response = await fetch('http://127.0.0.1:8000/scrape-google-maps', {
+      const response = await fetch('http://127.0.0.1:8000/scrape-bing-maps', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -219,15 +228,15 @@ export default function GoogleMapsScraper() {
   return (
     <div className="min-h-screen bg-gray-50 p-8">
       <Head>
-        <title>Google Maps Scraper - Email Agent</title>
+        <title>Bing Maps Scraper - Email Agent</title>
       </Head>
       <Toaster position="top-right" />
 
       <div className="max-w-6xl mx-auto">
         {/* Header */}
         <div className="mb-8">
-          <h1 className="text-3xl font-bold text-gray-800 mb-2">Google Maps Scraper</h1>
-          <p className="text-gray-600">Find businesses and extract contact information from Google Maps</p>
+          <h1 className="text-3xl font-bold text-gray-800 mb-2">Bing Maps Scraper</h1>
+          <p className="text-gray-600">Find businesses and extract contact information from Bing Maps</p>
         </div>
 
         {/* Scraping Form */}

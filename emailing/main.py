@@ -973,6 +973,64 @@ async def seed_dev():
     
     return {"status": "seeded", "user_id": user_id}
 
+# --------------------
+# Google Maps Scraping Endpoints
+# --------------------
+@app.post("/scrape-google-maps", response_model=ScrapeResponse)
+async def scrape_google_maps_endpoint(request: ScrapeRequest, background_tasks: BackgroundTasks, current_user: dict = Depends(get_current_user)):
+    try:
+        # Start the scraping in the background
+        background_tasks.add_task(
+            save_google_scraped_data_to_db,
+            request.query,
+            request.max_businesses,
+            str(current_user["_id"])
+        )
+        
+        return {
+            "status": "started",
+            "message": f"Google Maps scraping started for '{request.query}'. Results will be saved to database.",
+            "total_requested": request.max_businesses
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+async def save_google_scraped_data_to_db(query: str, max_businesses: int, user_id: str):
+    """Background task that performs Google Maps scraping and saves to DB"""
+    try:
+        # Import the Google Maps scraping function
+        from google_scraper import scrape_google_maps
+        
+        results = scrape_google_maps(query, max_businesses)
+        
+        # Convert to lead format for your database
+        leads_to_insert = []
+        for business in results:
+            lead = {
+                "company_name": business.get("company_name", ""),
+                "contact_number": business.get("phone", ""),
+                "email": business.get("emails", [""])[0] if business.get("emails") else None,
+                "owner_name": "",  # Can't get this from Google Maps
+                "mail_sent": False,
+                "created_at": datetime.utcnow(),
+                "user_id": user_id,
+                "source": "google_maps_scraper",
+                "website": business.get("website", ""),
+                "additional_info": {
+                    "all_emails": business.get("emails", []),
+                    "scraped_with_proxy": True
+                }
+            }
+            leads_to_insert.append(lead)
+        
+        if leads_to_insert:
+            await leads_col.insert_many(leads_to_insert)
+            print(f"✅ Saved {len(leads_to_insert)} Google Maps leads to database")
+        
+    except Exception as e:
+        print(f"❌ Error in background Google Maps scraping task: {str(e)}")
+        traceback.print_exc()
+
 @app.get("/")
 async def root():
     return {"status": "ok", "db": MONGODB_DB}
