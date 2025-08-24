@@ -35,7 +35,7 @@ load_dotenv()
 # --------------------
 # Config
 # --------------------
-MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
+MONGODB_URI = os.getenv("MONGODB_URI")
 MONGODB_DB = os.getenv("MONGODB_DB", "email_agent_db")
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", 465))
@@ -668,7 +668,7 @@ async def rephrase_email(request: RephraseRequest, current_user: dict = Depends(
     
     if not rephrase_agent:
         raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            status_code=status.HTTP_503_SERVICE_UNAVERAGE,
             detail="Rephrasing service not configured"
         )
     
@@ -787,6 +787,28 @@ async def create_lead(payload: LeadIn, current_user: dict = Depends(get_current_
     doc["mail_sent"] = False
     doc["created_at"] = datetime.utcnow()
     doc["user_id"] = str(current_user["_id"])
+    r = await leads_col.insert_one(doc)
+    created = await leads_col.find_one({"_id": r.inserted_id})
+    return serialize_doc(created)
+
+@app.post("/leads/manual", response_model=LeadOut, status_code=status.HTTP_201_CREATED)
+async def create_lead_manual(payload: LeadIn, current_user: dict = Depends(get_current_user)):
+    """
+    Create a single lead manually
+    """
+    # Validate email if provided
+    if payload.email and not is_valid_email(payload.email):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid email format"
+        )
+    
+    doc = payload.dict()
+    doc["mail_sent"] = False
+    doc["created_at"] = datetime.utcnow()
+    doc["user_id"] = str(current_user["_id"])
+    doc["source"] = "manual_entry"
+    
     r = await leads_col.insert_one(doc)
     created = await leads_col.find_one({"_id": r.inserted_id})
     return serialize_doc(created)
@@ -999,7 +1021,7 @@ async def scrape_bing_maps_endpoint(request: ScrapeRequest, background_tasks: Ba
         raise HTTPException(status_code=500, detail=str(e))
 
 async def save_scraped_data_to_db(query: str, max_businesses: int, user_id: str):
-    """Background task that performs scraping and saves to DB"""
+    """Background task that performs scraping and saves to DB in batches of 10"""
     try:
         # Import here to avoid circular imports
         from scraper import scrape_bing_maps
@@ -1008,7 +1030,9 @@ async def save_scraped_data_to_db(query: str, max_businesses: int, user_id: str)
         
         # Convert to lead format for your database
         leads_to_insert = []
-        for business in results:
+        batch_size = 10  # Save in batches of 10 to reduce API calls
+        
+        for i, business in enumerate(results):
             lead = {
                 "company_name": business.shop_name,
                 "contact_number": business.phone,
@@ -1026,10 +1050,14 @@ async def save_scraped_data_to_db(query: str, max_businesses: int, user_id: str)
                 }
             }
             leads_to_insert.append(lead)
+            
+            # Save in batches of 10
+            if len(leads_to_insert) >= batch_size or i == len(results) - 1:
+                await leads_col.insert_many(leads_to_insert)
+                print(f"✅ Saved batch of {len(leads_to_insert)} leads to database")
+                leads_to_insert = []  # Reset for next batch
         
-        if leads_to_insert:
-            await leads_col.insert_many(leads_to_insert)
-            print(f"✅ Saved {len(leads_to_insert)} leads to database")
+        print(f"🎉 Total {len(results)} leads processed and saved in batches")
         
     except Exception as e:
         print(f"❌ Error in background scraping task: {str(e)}")
@@ -1115,17 +1143,20 @@ async def scrape_google_maps_endpoint(request: ScrapeRequest, background_tasks: 
         raise HTTPException(status_code=500, detail=str(e))
 
 async def save_google_scraped_data_to_db(query: str, max_businesses: int, user_id: str):
-    """Background task that performs Google Maps scraping and saves to DB"""
+    """Background task that performs Google Maps scraping and saves to DB in batches of 10, skipping duplicates."""
     try:
-        # Import the Google Maps scraping function
-        from google_scraper import scrape_google_maps
-        
+        from google_scraper import scrape_google_maps  # Import here to avoid circular imports
+        from pymongo import UpdateOne
+        from pymongo.errors import BulkWriteError
+
         results = scrape_google_maps(query, max_businesses)
-        
-        # Convert to lead format for your database
-        leads_to_insert = []
-        for business in results:
-            lead = {
+
+        batch_size = 10
+        operations = []
+
+        for i, business in enumerate(results):
+            # Prepare the lead document
+            lead_doc = {
                 "company_name": business.get("company_name", ""),
                 "contact_number": business.get("phone", ""),
                 "email": business.get("emails", [""])[0] if business.get("emails") else None,
@@ -1137,15 +1168,37 @@ async def save_google_scraped_data_to_db(query: str, max_businesses: int, user_i
                 "website": business.get("website", ""),
                 "additional_info": {
                     "all_emails": business.get("emails", []),
-                    "scraped_with_proxy": True
+                    "scraped_with_proxy": True,
+                    "original_query": query  # Store the query that found this lead
                 }
             }
-            leads_to_insert.append(lead)
-        
-        if leads_to_insert:
-            await leads_col.insert_many(leads_to_insert)
-            print(f"✅ Saved {len(leads_to_insert)} Google Maps leads to database")
-        
+
+            # Create UpdateOne operation (duplicate skipping with upsert)
+            filter = {
+                "email": lead_doc["email"],
+                "company_name": lead_doc["company_name"],
+                "user_id": user_id
+            }
+            operation = UpdateOne(
+                filter,
+                {'$setOnInsert': lead_doc},  # Only set on insert
+                upsert=True
+            )
+            operations.append(operation)
+
+            # Execute in batches of 10
+            if len(operations) >= batch_size or i == len(results) - 1:
+                try:
+                    result = await leads_col.bulk_write(operations, ordered=False)
+                    print(f"✅ Batch completed. Inserted: {result.upserted_count}, Matched: {result.matched_count}")
+                except BulkWriteError as bwe:
+                    print(f"⚠️ Batch completed with some duplicates ignored. "
+                          f"Inserted: {bwe.details.get('nInserted', 0)}, "
+                          f"Duplicates: {len(bwe.details.get('writeErrors', []))}")
+                operations = []  # Reset for next batch
+
+        print(f"🎉 Scraping complete. Processed {len(results)} businesses in batches of {batch_size}.")
+
     except Exception as e:
         print(f"❌ Error in background Google Maps scraping task: {str(e)}")
         traceback.print_exc()
