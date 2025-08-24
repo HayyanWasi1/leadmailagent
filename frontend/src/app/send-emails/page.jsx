@@ -4,6 +4,8 @@ import Head from 'next/head';
 import toast, { Toaster } from 'react-hot-toast';
 
 export default function SendEmails() {
+  const BASE_URL = process.env.NEXT_PUBLIC_BASE_URL;
+
   const [selectedTemplate, setSelectedTemplate] = useState(null);
   const [emailContent, setEmailContent] = useState('');
   const [isSending, setIsSending] = useState(false);
@@ -26,7 +28,16 @@ export default function SendEmails() {
     email: '',
     password: '',
     sender_name: '',
-    daily_limit: 0 // Changed from 100 to 0
+    daily_limit: 0
+  });
+  
+  // New state for manual lead addition
+  const [showAddLeadModal, setShowAddLeadModal] = useState(false);
+  const [newLead, setNewLead] = useState({
+    company_name: '',
+    contact_number: '',
+    email: '',
+    owner_name: ''
   });
 
   // Function to get auth token from localStorage
@@ -59,9 +70,9 @@ export default function SendEmails() {
         };
 
         const [templatesRes, countRes, accountsRes] = await Promise.all([
-          fetch('http://127.0.0.1:8000/templates', { headers }),
-          fetch('http://127.0.0.1:8000/leads/count?sent=false', { headers }), // ✅ add sent=false
-          fetch('http://127.0.0.1:8000/email-accounts', { headers })
+          fetch(`${BASE_URL}/templates`, { headers }),
+          fetch(`${BASE_URL}/leads/count?sent=false`, { headers }), // ✅ add sent=false
+          fetch(`${BASE_URL}/email-accounts`, { headers })
         ]);
 
         if (!templatesRes.ok) {
@@ -155,7 +166,7 @@ export default function SendEmails() {
       };
 
       // Get only unsent leads
-      const leadsRes = await fetch('http://127.0.0.1:8000/leads?sent=false&limit=1000', { headers });
+      const leadsRes = await fetch(`${BASE_URL}/leads?sent=false&limit=1000`, { headers });
 
       if (!leadsRes.ok) {
         if (leadsRes.status === 401) {
@@ -194,7 +205,7 @@ export default function SendEmails() {
       setTotalEmails(leadsToSend.length);
 
       // Send all emails at once using the new bulk endpoint
-      const response = await fetch('http://127.0.0.1:8000/send-emails', {
+      const response = await fetch(`${BASE_URL}/send-emails`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -227,7 +238,7 @@ export default function SendEmails() {
         while (attempts < maxAttempts && !isComplete) {
           await new Promise(resolve => setTimeout(resolve, 5000)); // Check every 5 seconds
 
-          const countRes = await fetch('http://127.0.0.1:8000/leads/count?sent=false', { headers });
+          const countRes = await fetch(`${BASE_URL}/leads/count?sent=false`, { headers });
 
           if (!countRes.ok) {
             if (countRes.status === 401) {
@@ -253,7 +264,7 @@ export default function SendEmails() {
         }
 
         // Update total leads count
-        const finalCountRes = await fetch('http://127.0.0.1:8000/leads/count?sent=false', { headers });
+        const finalCountRes = await fetch(`${BASE_URL}/leads/count?sent=false`, { headers });
         if (finalCountRes.ok) {
           const finalCountData = await finalCountRes.json();
           setTotalLeads(finalCountData.count);
@@ -299,7 +310,7 @@ export default function SendEmails() {
 
     const toastId = toast.loading('Rephrasing email...');
     try {
-      const response = await fetch('http://127.0.0.1:8000/rephrase-email', {
+      const response = await fetch(`${BASE_URL}/rephrase-email`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -361,7 +372,7 @@ export default function SendEmails() {
 
     const toastId = toast.loading('Creating template...');
     try {
-      const response = await fetch('http://127.0.0.1:8000/templates', {
+      const response = await fetch(`${BASE_URL}/templates`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -402,7 +413,7 @@ export default function SendEmails() {
 
     const toastId = toast.loading('Adding email account...');
     try {
-      const response = await fetch('http://127.0.0.1:8000/email-accounts', {
+      const response = await fetch(`${BASE_URL}/email-accounts`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -425,7 +436,7 @@ export default function SendEmails() {
         email: '',
         password: '',
         sender_name: '',
-        daily_limit: 0 // Changed from 100 to 0
+        daily_limit: 0
       });
       toast.success('Email account added!', { id: toastId });
     } catch (error) {
@@ -450,7 +461,7 @@ export default function SendEmails() {
 
     const toastId = toast.loading('Resetting account...');
     try {
-      const response = await fetch(`http://127.0.0.1:8000/email-accounts/${accountId}/reset`, {
+      const response = await fetch(`${BASE_URL}/email-accounts/${accountId}/reset`, {
         method: 'POST',
         headers: {
           'Authorization': `Bearer ${token}`,
@@ -465,7 +476,7 @@ export default function SendEmails() {
       }
 
       // Refresh accounts
-      const accountsRes = await fetch('http://127.0.0.1:8000/email-accounts', {
+      const accountsRes = await fetch(`${BASE_URL}/email-accounts`, {
         headers: {
           'Authorization': `Bearer ${token}`,
         },
@@ -484,6 +495,64 @@ export default function SendEmails() {
       toast.success('Account reset successfully!', { id: toastId });
     } catch (error) {
       toast.error(error.message || 'Failed to reset account', { id: toastId });
+    }
+  };
+
+  // Function to handle manual lead addition
+  const handleAddLead = async () => {
+    const token = getAuthToken();
+    if (!token) {
+      toast.error('Please log in to add leads');
+      return;
+    }
+
+    // Basic validation
+    if (!newLead.company_name && !newLead.email) {
+      toast.error('Please provide at least a company name or email');
+      return;
+    }
+
+    if (newLead.email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(newLead.email)) {
+      toast.error('Please enter a valid email address');
+      return;
+    }
+
+    const toastId = toast.loading('Adding lead...');
+    try {
+      const response = await fetch(`${BASE_URL}/leads/manual`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`,
+        },
+        body: JSON.stringify(newLead),
+      });
+
+      if (!response.ok) {
+        if (response.status === 401) {
+          throw new Error('Authentication failed. Please log in again.');
+        }
+        const errorData = await response.json().catch(() => ({}));
+        throw new Error(errorData.detail || 'Failed to add lead');
+      }
+
+      const savedLead = await response.json();
+      
+      // Update the total leads count
+      setTotalLeads(prev => prev + 1);
+      
+      // Reset form and close modal
+      setNewLead({
+        company_name: '',
+        contact_number: '',
+        email: '',
+        owner_name: ''
+      });
+      setShowAddLeadModal(false);
+      
+      toast.success('Lead added successfully!', { id: toastId });
+    } catch (error) {
+      toast.error(error.message || 'Failed to add lead', { id: toastId });
     }
   };
 
@@ -507,7 +576,15 @@ export default function SendEmails() {
           <div className="lg:w-1/3 space-y-6">
             <div className="bg-white rounded-xl border border-gray-200 shadow-sm">
               <div className="p-5 border-b border-gray-200">
-                <h2 className="text-lg font-semibold text-gray-800">Available Leads</h2>
+                <div className="flex justify-between items-center">
+                  <h2 className="text-lg font-semibold text-gray-800">Available Leads</h2>
+                  <button
+                    onClick={() => setShowAddLeadModal(true)}
+                    className="text-sm text-indigo-600"
+                  >
+                    + Add Lead
+                  </button>
+                </div>
                 <div className="text-3xl font-bold text-indigo-600">{totalLeads}</div>
               </div>
             </div>
@@ -874,6 +951,92 @@ export default function SendEmails() {
                 </button>
               </div>
             )}
+          </div>
+        </div>
+      )}
+
+      {showAddLeadModal && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
+          <div className="bg-white rounded-xl max-w-md w-full p-6">
+            <div className="flex justify-between items-center mb-4">
+              <h3 className="text-lg font-bold">Add New Lead</h3>
+              <button 
+                onClick={() => setShowAddLeadModal(false)} 
+                className="text-gray-400 hover:text-gray-600"
+              >
+                &times;
+              </button>
+            </div>
+            
+            <div className="space-y-4">
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">
+                  Company Name
+                </label>
+                <input
+                  type="text"
+                  value={newLead.company_name}
+                  onChange={(e) => setNewLead({...newLead, company_name: e.target.value})}
+                  className="w-full rounded-md border-gray-300 shadow-sm p-2 text-sm"
+                  placeholder="Enter company name"
+                />
+              </div>
+              
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">
+                  Contact Person
+                </label>
+                <input
+                  type="text"
+                  value={newLead.owner_name}
+                  onChange={(e) => setNewLead({...newLead, owner_name: e.target.value})}
+                  className="w-full rounded-md border-gray-300 shadow-sm p-2 text-sm"
+                  placeholder="Enter contact person name"
+                />
+              </div>
+              
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">
+                  Email Address
+                </label>
+                <input
+                  type="email"
+                  value={newLead.email}
+                  onChange={(e) => setNewLead({...newLead, email: e.target.value})}
+                  className="w-full rounded-md border-gray-300 shadow-sm p-2 text-sm"
+                  placeholder="Enter email address"
+                />
+              </div>
+              
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">
+                  Phone Number
+                </label>
+                <input
+                  type="tel"
+                  value={newLead.contact_number}
+                  onChange={(e) => setNewLead({...newLead, contact_number: e.target.value})}
+                  className="w-full rounded-md border-gray-300 shadow-sm p-2 text-sm"
+                  placeholder="Enter phone number"
+                />
+              </div>
+            </div>
+            
+            <div className="mt-6 flex justify-end gap-3">
+              <button
+                onClick={() => setShowAddLeadModal(false)}
+                className="px-4 py-2 text-sm rounded-md text-gray-700 bg-gray-100 hover:bg-gray-200"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleAddLead}
+                disabled={!newLead.company_name && !newLead.email}
+                className="px-4 py-2 text-sm rounded-md text-white bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50"
+              >
+                Add Lead
+              </button>
+            </div>
           </div>
         </div>
       )}

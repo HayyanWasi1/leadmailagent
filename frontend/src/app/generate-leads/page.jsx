@@ -4,6 +4,8 @@ import React, { useState, useEffect, useRef } from 'react';
 import toast, { Toaster } from 'react-hot-toast';
 
 const GoogleMapsScraper = () => {
+  const BASE_URL = process.env.NEXT_PUBLIC_BASE_URL;
+
   // State for form inputs
   const [query, setQuery] = useState('');
   const [maxBusinesses, setMaxBusinesses] = useState(10);
@@ -53,7 +55,7 @@ const GoogleMapsScraper = () => {
         throw new Error('No authentication token found. Please log in.');
       }
 
-      const response = await fetch('http://localhost:8000/leads?limit=10&sent=false', {
+      const response = await fetch(`${BASE_URL}/leads?limit=10&sent=false`, {
         headers: {
           'Authorization': `Bearer ${token}`,
         }
@@ -105,7 +107,7 @@ const GoogleMapsScraper = () => {
     });
 
     try {
-      const response = await fetch('http://localhost:8000/scrape-google-maps', {
+      const response = await fetch(`${BASE_URL}/scrape-google-maps`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -165,7 +167,7 @@ const GoogleMapsScraper = () => {
         }
 
         // Get count of unsent leads (newly scraped ones)
-        const countRes = await fetch('http://localhost:8000/leads/count?sent=false', {
+        const countRes = await fetch(`${BASE_URL}/leads/count?sent=false`, {
           headers: {
             'Authorization': `Bearer ${token}`,
           }
