@@ -2,6 +2,8 @@
 import React, { useState } from 'react';
 
 const LoginPage = () => {
+  const BASE_URL = process.env.NEXT_PUBLIC_BASE_URL;
+
   const [formData, setFormData] = useState({
     email: '',
     password: ''
@@ -33,7 +35,7 @@ const LoginPage = () => {
 
       console.log([...body.entries()]); // ✅ Shows actual key/value pairs
 
-      const response = await fetch('http://127.0.0.1:8000/login', {
+      const response = await fetch(`${BASE_URL}/login`, {
         method: 'POST',
         body: body, // send FormData
       });
@@ -59,23 +61,6 @@ const LoginPage = () => {
       console.error('Login error:', error);
     } finally {
       setIsLoading(false);
-    }
-  };
-
-  // Test backend connection
-  const testConnection = async () => {
-    try {
-      const response = await fetch('http://127.0.0.1:8000/');
-      if (response.ok) {
-        console.log('Backend connection successful');
-        alert('Backend connection successful!');
-      } else {
-        console.log('Backend connection failed');
-        alert('Backend connection failed!');
-      }
-    } catch (error) {
-      console.error('Backend connection test failed:', error);
-      alert('Backend connection test failed!');
     }
   };
 

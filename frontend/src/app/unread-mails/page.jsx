@@ -4,6 +4,8 @@ import React, { useState } from 'react';
 import toast, { Toaster } from 'react-hot-toast';
 
 function UnreadEmailsPage() {
+  const BASE_URL = process.env.NEXT_PUBLIC_BASE_URL;
+
   const [unreadEmails, setUnreadEmails] = useState([]);
   const [loading, setLoading] = useState(false);
 
@@ -22,7 +24,7 @@ function UnreadEmailsPage() {
         return;
       }
 
-      const response = await fetch('http://127.0.0.1:8000/unread-emails', {
+      const response = await fetch(`${BASE_URL}/unread-emails`, {
         headers: {
           'Authorization': `Bearer ${token}`
         }
