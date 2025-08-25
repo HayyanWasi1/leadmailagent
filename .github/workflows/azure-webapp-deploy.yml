@@ -3,7 +3,7 @@ name: Build and Deploy FastAPI to Azure WebApp
 on:
   push:
     branches:
-      - main  # Deploy only when pushing to main branch
+      - main
 
 jobs:
   build-and-deploy:
@@ -18,16 +18,15 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Install dependencies
-        run: |
-          cd emailing
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+      - name: Install backend dependencies
+        run: pip install -r emailing/requirements.txt
 
-      - name: Zip artifact for deployment
+      - name: Install frontend dependencies
+        run: pip install -r frontend/requirements.txt
+
+      - name: Prepare artifact
         run: |
-          cd ..
-          zip -r release.zip .
+          zip -r release.zip . -x "*.git*"
 
       - name: Deploy to Azure WebApp
         uses: azure/webapps-deploy@v2
